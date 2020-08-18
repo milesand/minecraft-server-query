@@ -1,8 +1,12 @@
 //! [Query Protocol](https://wiki.vg/Query), used for querying the status of a minecraft server.
 
-use std::convert::TryFrom;
+use std::convert::{TryFrom};
 use std::io;
 use std::net::{IpAddr, ToSocketAddrs, UdpSocket};
+
+mod error;
+
+use error::{Error, ParseError};
 
 #[derive(Debug)]
 pub struct Querier {
@@ -17,9 +21,6 @@ struct Retries {
     pub max: u64,
     pub current: u64,
 }
-
-#[derive(Copy, Clone, Debug)]
-pub struct ParseError;
 
 impl Querier {
     pub fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
@@ -54,7 +55,7 @@ impl Querier {
         }
     }
 
-    fn handshake(&mut self) -> io::Result<i32> {
+    fn handshake(&mut self) -> Result<i32, Error> {
         let request = {
             let mut request = [0xfe, 0xfd, 0x09, 0x00, 0x00, 0x00, 0x00];
             request[3..].copy_from_slice(&self.session_id.to_be_bytes());
@@ -75,24 +76,35 @@ impl Querier {
                         continue;
                     }
                     self.reset_retry_counter();
-                    return Err(e);
+                    return Err(e.into());
                 }
             };
 
             self.reset_retry_counter();
 
-            // TODO: Add proper error handling for mal-formed responses
+            match buf.get(0).copied() {
+                Some(9) => {},
+                _ => return Err(ParseError::Unspecified.into()),
+            }
+            match buf.get(1..5) {
+                Some(session) if session == self.session_id.to_be_bytes() => {},
+                _ => return Err(ParseError::Unspecified.into()),
+            }
 
-            let token = std::str::from_utf8(&buf[5..len - 1])
-                .expect("Invalid response: Non-utf8 token")
-                .parse::<i32>()
-                .expect("Invalid response: Non-numeric token");
+            let token = if len >= 6 && buf[len - 1] == 0 { Ok(()) } else { Err(()) }
+                .and_then(|_| {
+                    std::str::from_utf8(&buf[5..len - 1]) .map_err(|_| ())
+                })
+                .and_then(|s| {
+                    s.parse::<i32>().map_err(|_| ())
+                })
+                .map_err(|_| ParseError::Unspecified)?;
 
             return Ok(token);
         }
     }
 
-    pub fn basic_stat(&mut self) -> io::Result<BasicStat> {
+    pub fn basic_stat(&mut self) -> Result<BasicStat, Error> {
         let mut token = self.last_token.ok_or(()).or_else(|_| self.handshake())?;
 
         let mut request = [0; 11];
@@ -111,17 +123,18 @@ impl Querier {
                         && self.should_retry()
                     {
                         self.generate_new_session_id();
+                        self.last_token = None;
                         token = self.handshake()?;
                         continue;
                     }
                     self.reset_retry_counter();
-                    return Err(e);
+                    return Err(e.into());
                 }
             };
             self.reset_retry_counter();
             self.last_token = Some(token);
             println!("{:?}", &self.buf[..len]);
-            return Ok(BasicStat::parse_bytes(self.session_id, &self.buf[..len]).expect("Parse Error"));
+            return Ok(BasicStat::parse_bytes(self.session_id, &self.buf[..len])?);
         }
     }
 }
@@ -140,14 +153,14 @@ pub struct BasicStat {
 impl BasicStat {
     fn parse_bytes(session_id: u32, buf: &[u8]) -> Result<Self, ParseError> {
         if buf.len() < 13 {
-            return Err(ParseError);
+            return Err(ParseError::Unspecified);
         }
         let (header, body) = buf.split_at(5);
         if header[0] != 0 {
-            return Err(ParseError);
+            return Err(ParseError::Unspecified);
         }
         if header[1..5] != session_id.to_be_bytes() {
-            return Err(ParseError);
+            return Err(ParseError::Unspecified);
         }
     
         let mut result_buf = vec![];
@@ -156,27 +169,27 @@ impl BasicStat {
         let mut end_indices = [0; 2];
         let mut last_end_index = 0;
         for end_index in end_indices.iter_mut() {
-            let content = body_iter.next().ok_or(ParseError)?;
+            let content = body_iter.next().ok_or(ParseError::Unspecified)?;
             result_buf.extend_from_slice(content);
             *end_index = last_end_index + content.len();
             last_end_index += content.len();
         }
-        result_buf.extend_from_slice(body_iter.next().ok_or(ParseError)?);
+        result_buf.extend_from_slice(body_iter.next().ok_or(ParseError::Unspecified)?);
     
         let mut players = [0; 2];
         for player in &mut players {
-            let player_bytes = body_iter.next().ok_or(ParseError)?;
-            let player_str = std::str::from_utf8(player_bytes).map_err(|_| ParseError)?;
-            *player = player_str.parse().map_err(|_| ParseError)?;
+            let player_bytes = body_iter.next().ok_or(ParseError::Unspecified)?;
+            let player_str = std::str::from_utf8(player_bytes).map_err(|_| ParseError::Unspecified)?;
+            *player = player_str.parse().map_err(|_| ParseError::Unspecified)?;
         }
     
-        let port_ip = body_iter.next().ok_or(ParseError)?;
+        let port_ip = body_iter.next().ok_or(ParseError::Unspecified)?;
         if port_ip.len() < 3 {
-            return Err(ParseError);
+            return Err(ParseError::Unspecified);
         }
         let host_port = u16::from_le_bytes(<[u8; 2]>::try_from(&port_ip[..2]).unwrap());
-        let host_ip_str = std::str::from_utf8(&port_ip[2..]).map_err(|_| ParseError)?;
-        let host_ip = host_ip_str.parse().map_err(|_| ParseError)?;
+        let host_ip_str = std::str::from_utf8(&port_ip[2..]).map_err(|_| ParseError::Unspecified)?;
+        let host_ip = host_ip_str.parse().map_err(|_| ParseError::Unspecified)?;
         
         Ok(BasicStat {
             buf: result_buf,
