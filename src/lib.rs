@@ -134,7 +134,7 @@ impl Querier {
             self.reset_retry_counter();
             self.last_token = Some(token);
             println!("{:?}", &self.buf[..len]);
-            return Ok(BasicStat::parse_bytes(self.session_id, &self.buf[..len])?);
+            return Ok(BasicStat::parse_data(self.session_id, &self.buf[..len])?);
         }
     }
 }
@@ -151,11 +151,11 @@ pub struct BasicStat {
 }
 
 impl BasicStat {
-    fn parse_bytes(session_id: u32, buf: &[u8]) -> Result<Self, ParseError> {
-        if buf.len() < 13 {
+    fn parse_data(session_id: u32, data: &[u8]) -> Result<Self, ParseError> {
+        if data.len() < 13 {
             return Err(ParseError::Unspecified);
         }
-        let (header, body) = buf.split_at(5);
+        let (header, body) = data.split_at(5);
         if header[0] != 0 {
             return Err(ParseError::Unspecified);
         }
@@ -228,5 +228,114 @@ impl BasicStat {
 
     pub fn host_ip(&self) -> IpAddr {
         self.host_ip
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct FullStat {
+    buf: Vec<u8>,
+    hostname_end: usize,
+    gametype_end: usize,
+    gameid_end: usize,
+    version_end: usize,
+    plugins_end: usize,
+    map_end: usize,
+    num_players: u64,
+    max_players: u64,
+    host_port: u16,
+    host_ip: IpAddr,
+    player_ends: Vec<usize>,
+}
+
+impl FullStat {
+    fn parse_data(session_id: u32, data: &[u8]) -> Result<Self, ParseError> {
+        if data.len() < 16 || data[0] != 0 || data[1..5] != session_id.to_be_bytes()
+            || data[data.len()-2..] != [0, 0]
+        {
+            return Err(ParseError::Unspecified);
+        }
+
+        let mut buf = Vec::new();
+
+        let mut idx = 16;
+        let mut kv_iter = data[idx..]
+            .split(|&b| b == 0)
+            .inspect(|&s| idx += s.len() + 1);
+        let mut ends = [0; 6];
+
+        macro_rules! parse_kv {
+            ($expected_key:expr, $do_with_value:expr) => {
+                {
+                    let key = kv_iter.next();
+                    if key != Some($expected_key) {
+                        return Err(ParseError::Unspecified);
+                    }
+                    let value = kv_iter.next();
+                    if let Some(value) = value {
+                        $do_with_value(value)
+                    } else {
+                        return Err(ParseError::Unspecified);
+                    }
+                }
+            };
+            ($expected_key:expr, APPEND_TO_BUF, $idx:expr) => {
+                parse_kv!($expected_key, |value| {
+                    buf.copy_from_slice(value);
+                    ends[$idx] = buf.len();
+                })
+            };
+            ($expected_key:expr, PARSE_AS, $tgt:ty) => {
+                parse_kv!($expected_key, |value| {
+                    std::str::from_utf8(value)
+                        .map_err(|_| ())
+                        .and_then(|value| {
+                            value.parse::<$tgt>().map_err(|_| ())
+                        })
+                        .map_err(|_| ParseError::Unspecified)
+                })
+            }
+        }
+
+        parse_kv!(b"hostname", APPEND_TO_BUF, 0);
+        parse_kv!(b"gametype", APPEND_TO_BUF, 1);
+        parse_kv!(b"game_id",  APPEND_TO_BUF, 2);
+        parse_kv!(b"version",  APPEND_TO_BUF, 3);
+        parse_kv!(b"plugins",  APPEND_TO_BUF, 4);
+        parse_kv!(b"map",      APPEND_TO_BUF, 5);
+
+        let num_players = parse_kv!(b"numplayers", PARSE_AS, u64)?;
+        let max_players = parse_kv!(b"maxplayers", PARSE_AS, u64)?;
+        let host_port = parse_kv!(b"hostport", PARSE_AS, u16)?;
+        let host_ip = parse_kv!(b"hostip", PARSE_AS, IpAddr)?;
+        
+        if kv_iter.next() != Some(b"") {
+            return Err(ParseError::Unspecified);
+        }
+        
+        let mut player_ends = Vec::with_capacity(num_players as usize);
+        idx += 10;
+        let players_iter = data[idx..].split(|&b| b == 0);
+        for player in players_iter {
+            if player == b"" {
+                break;
+            }
+            buf.copy_from_slice(player);
+            player_ends.push(buf.len());
+        }
+
+        Ok(FullStat {
+            buf,
+            hostname_end: ends[0],
+            gametype_end: ends[1],
+            gameid_end: ends[2],
+            version_end: ends[3],
+            plugins_end: ends[4],
+            map_end: ends[5],
+            num_players,
+            max_players,
+            host_port,
+            host_ip,
+            player_ends,
+        })
     }
 }
