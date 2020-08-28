@@ -25,12 +25,12 @@ struct Retries {
 
 impl Querier {
     pub fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
-        let sock = UdpSocket::bind("0.0.0.0:11047")?;
+        let sock = UdpSocket::bind("0.0.0.0:0")?;
         sock.connect(addr)?;
         sock.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
         Ok(Querier {
             sock,
-            session_id: 307,
+            session_id: 0,
             last_token: None,
             retries: Some(Retries { max: 3, current: 0 }),
             buf: vec![0; 1024],
@@ -38,7 +38,7 @@ impl Querier {
     }
 
     fn generate_new_session_id(&mut self) {
-        // TODO: make this do something
+        self.session_id = self.session_id.wrapping_add(1);
     }
 
     fn should_retry(&mut self) -> bool {
@@ -127,7 +127,7 @@ impl Querier {
     fn stat<BUF, OUT>(&mut self) -> Result<OUT, Error>
     where
         BUF: AsMut<[u8]> + Default,
-        OUT: ParseData,
+        OUT: ParseDatagram,
     {
         let mut token = self.last_token.ok_or(()).or_else(|_| self.handshake())?;
 
@@ -159,7 +159,7 @@ impl Querier {
             self.reset_retry_counter();
             self.last_token = Some(token);
             println!("{:?}", &self.buf[..len]);
-            return Ok(<OUT>::parse_data(self.session_id, &self.buf[..len])?);
+            return Ok(<OUT>::parse_datagram(Some(self.session_id), &self.buf[..len])?);
         }
     }
 
@@ -184,6 +184,10 @@ pub struct BasicStat {
 }
 
 impl BasicStat {
+    pub fn parse_bytes(bytes: &[u8]) -> Result<Self, ParseError> {
+        Self::parse_datagram(None, bytes)
+    }
+
     pub fn motd(&self) -> &[u8] {
         &self.buf[..self.motd_end]
     }
@@ -213,16 +217,16 @@ impl BasicStat {
     }
 }
 
-impl ParseData for BasicStat {
-    fn parse_data(session_id: u32, data: &[u8]) -> Result<Self, ParseError> {
-        if data.len() < 13 {
+impl ParseDatagram for BasicStat {
+    fn parse_datagram(session_id: Option<u32>, datagram: &[u8]) -> Result<Self, ParseError> {
+        if datagram.len() < 13 {
             return Err(ParseError::Unspecified);
         }
-        let (header, body) = data.split_at(5);
+        let (header, body) = datagram.split_at(5);
         if header[0] != 0 {
             return Err(ParseError::Unspecified);
         }
-        if header[1..5] != session_id.to_be_bytes() {
+        if session_id.map(|id| id.to_be_bytes() != datagram[1..5]).unwrap_or(false) {
             return Err(ParseError::Unspecified);
         }
     
@@ -343,10 +347,12 @@ impl FullStat {
     }
 }
 
-impl ParseData for FullStat {
-    fn parse_data(session_id: u32, data: &[u8]) -> Result<Self, ParseError> {
-        if data.len() < 16 || data[0] != 0 || data[1..5] != session_id.to_be_bytes()
-            || data[data.len()-2..] != [0, 0]
+impl ParseDatagram for FullStat {
+    fn parse_datagram(session_id: Option<u32>, datagram: &[u8]) -> Result<Self, ParseError> {
+        if datagram.len() < 16
+            || datagram[0] != 0
+            || session_id.map(|id| id.to_be_bytes() != datagram[1..5]).unwrap_or(false)
+            || datagram[datagram.len()-2..] != [0, 0]
         {
             return Err(ParseError::Unspecified);
         }
@@ -354,7 +360,7 @@ impl ParseData for FullStat {
         let mut buf = Vec::new();
 
         let mut idx = 16;
-        let mut kv_iter = data[idx..]
+        let mut kv_iter = datagram[idx..]
             .split(|&b| b == 0)
             .inspect(|&s| idx += s.len() + 1);
         let mut ends = [0; 6];
@@ -410,7 +416,7 @@ impl ParseData for FullStat {
         
         let mut player_ends = Vec::with_capacity(num_players as usize);
         idx += 10;
-        let players_iter = data[idx..].split(|&b| b == 0);
+        let players_iter = datagram[idx..].split(|&b| b == 0);
         for player in players_iter {
             if player == b"" {
                 break;
@@ -436,6 +442,6 @@ impl ParseData for FullStat {
     }
 }
 
-trait ParseData: Sized {
-    fn parse_data(session_id: u32, data: &[u8]) -> Result<Self, ParseError>;
+trait ParseDatagram: Sized {
+    fn parse_datagram(session_id: Option<u32>, datagram: &[u8]) -> Result<Self, ParseError>;
 }
