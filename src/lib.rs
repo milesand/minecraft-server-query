@@ -1,8 +1,9 @@
 //! [Query Protocol](https://wiki.vg/Query), used for querying the status of a minecraft server.
 
-use std::convert::{TryFrom};
+use std::convert::TryFrom;
 use std::io;
 use std::net::{IpAddr, ToSocketAddrs, UdpSocket};
+use std::time::Duration;
 
 mod error;
 
@@ -53,6 +54,25 @@ impl Querier {
         if let Some(ref mut retries) = self.retries {
             retries.current = 0;
         }
+    }
+
+    pub fn set_max_retries(&mut self, max_retries: Option<u64>) {
+        if max_retries == Some(0) {
+            panic!("set_max_retries called with max_retries == Some(0)");
+        }
+        self.retries = max_retries.map(|max| Retries { max, current: 0 });
+    }
+
+    pub fn max_retries(&self) -> Option<u64> {
+        self.retries.map(|r| r.max)
+    }
+
+    pub fn set_timeout(&mut self, dur: Duration) -> Result<(), io::Error> {
+        self.sock.set_read_timeout(Some(dur))
+    }
+
+    pub fn timeout(&self) -> Result<Duration, io::Error> {
+        self.sock.read_timeout().map(Option::unwrap)
     }
 
     fn handshake(&mut self) -> Result<i32, Error> {
