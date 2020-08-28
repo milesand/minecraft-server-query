@@ -1,6 +1,6 @@
 //! [Query Protocol](https://wiki.vg/Query), used for querying the status of a minecraft server.
 
-use std::convert::TryFrom;
+use std::convert::TryInto;
 use std::io;
 use std::net::{IpAddr, ToSocketAddrs, UdpSocket};
 use std::time::Duration;
@@ -90,9 +90,7 @@ impl Querier {
                 Ok(len) => len,
                 Err(e) => {
                     use io::ErrorKind::*;
-                    if [WouldBlock, TimedOut].contains(&e.kind())
-                        && self.should_retry()
-                    {
+                    if [WouldBlock, TimedOut].contains(&e.kind()) && self.should_retry() {
                         continue;
                     }
                     self.reset_retry_counter();
@@ -103,22 +101,41 @@ impl Querier {
             self.reset_retry_counter();
 
             match buf.get(0).copied() {
-                Some(9) => {},
-                _ => return Err(ParseError::Unspecified.into()),
+                Some(9) => {}
+                Some(got) => return Err(ParseError::InvalidType { expected: 9, got }.into()),
+                None => return Err(ParseError::UnexpectedEndOfData.into()),
             }
             match buf.get(1..5) {
-                Some(session) if session == self.session_id.to_be_bytes() => {},
-                _ => return Err(ParseError::Unspecified.into()),
+                Some(session) if session == self.session_id.to_be_bytes() => {}
+                Some(got_bytes) => {
+                    let got = u32::from_be_bytes(got_bytes.try_into().unwrap());
+                    return Err(ParseError::SessionIdMismatch {
+                        expected: self.session_id,
+                        got,
+                    }
+                    .into());
+                }
+                None => return Err(ParseError::UnexpectedEndOfData.into()),
             }
 
-            let token = if len >= 6 && buf[len - 1] == 0 { Ok(()) } else { Err(()) }
-                .and_then(|_| {
-                    std::str::from_utf8(&buf[5..len - 1]) .map_err(|_| ())
-                })
-                .and_then(|s| {
-                    s.parse::<i32>().map_err(|_| ())
-                })
-                .map_err(|_| ParseError::Unspecified)?;
+            if len < 6 || buf[len - 1] != 0 {
+                return Err(ParseError::UnexpectedEndOfData.into());
+            }
+
+            let token_str = std::str::from_utf8(&buf[5..len - 1]).map_err(|err| {
+                ParseError::PartParseFailed {
+                    bytes: buf[5..len - 1].to_owned(),
+                    ty: "i32",
+                    source: Some(Box::new(err)),
+                }
+            })?;
+            let token = token_str
+                .parse::<i32>()
+                .map_err(|err| ParseError::PartParseFailed {
+                    bytes: buf[5..len - 1].to_owned(),
+                    ty: "i32",
+                    source: Some(Box::new(err)),
+                })?;
 
             return Ok(token);
         }
@@ -144,9 +161,7 @@ impl Querier {
                 Ok(len) => len,
                 Err(e) => {
                     use io::ErrorKind::*;
-                    if [WouldBlock, TimedOut].contains(&e.kind())
-                        && self.should_retry()
-                    {
+                    if [WouldBlock, TimedOut].contains(&e.kind()) && self.should_retry() {
                         self.generate_new_session_id();
                         self.last_token = None;
                         token = self.handshake()?;
@@ -159,7 +174,10 @@ impl Querier {
             self.reset_retry_counter();
             self.last_token = Some(token);
             println!("{:?}", &self.buf[..len]);
-            return Ok(<OUT>::parse_datagram(Some(self.session_id), &self.buf[..len])?);
+            return Ok(<OUT>::parse_datagram(
+                Some(self.session_id),
+                &self.buf[..len],
+            )?);
         }
     }
 
@@ -220,44 +238,79 @@ impl BasicStat {
 impl ParseDatagram for BasicStat {
     fn parse_datagram(session_id: Option<u32>, datagram: &[u8]) -> Result<Self, ParseError> {
         if datagram.len() < 13 {
-            return Err(ParseError::Unspecified);
+            return Err(ParseError::TooShort);
         }
         let (header, body) = datagram.split_at(5);
         if header[0] != 0 {
-            return Err(ParseError::Unspecified);
+            return Err(ParseError::InvalidType {
+                expected: 0,
+                got: header[0],
+            });
         }
-        if session_id.map(|id| id.to_be_bytes() != datagram[1..5]).unwrap_or(false) {
-            return Err(ParseError::Unspecified);
+        if let Some(id) = session_id {
+            let got_id = u32::from_be_bytes(datagram[1..5].try_into().unwrap());
+            if id != got_id {
+                return Err(ParseError::SessionIdMismatch {
+                    expected: id,
+                    got: got_id,
+                });
+            }
         }
-    
+
         let mut result_buf = vec![];
         let mut body_iter = body.split(|&b| b == 0);
-    
+
         let mut end_indices = [0; 2];
         let mut last_end_index = 0;
         for end_index in end_indices.iter_mut() {
-            let content = body_iter.next().ok_or(ParseError::Unspecified)?;
+            let content = body_iter.next().ok_or(ParseError::UnexpectedEndOfData)?;
             result_buf.extend_from_slice(content);
             *end_index = last_end_index + content.len();
             last_end_index += content.len();
         }
-        result_buf.extend_from_slice(body_iter.next().ok_or(ParseError::Unspecified)?);
-    
+        result_buf.extend_from_slice(body_iter.next().ok_or(ParseError::UnexpectedEndOfData)?);
+
         let mut players = [0; 2];
         for player in &mut players {
-            let player_bytes = body_iter.next().ok_or(ParseError::Unspecified)?;
-            let player_str = std::str::from_utf8(player_bytes).map_err(|_| ParseError::Unspecified)?;
-            *player = player_str.parse().map_err(|_| ParseError::Unspecified)?;
+            let player_bytes = body_iter.next().ok_or(ParseError::UnexpectedEndOfData)?;
+            let player_str =
+                std::str::from_utf8(player_bytes).map_err(|err| ParseError::PartParseFailed {
+                    bytes: player_bytes.to_owned(),
+                    ty: "u64",
+                    source: Some(Box::new(err)),
+                })?;
+            *player = player_str
+                .parse()
+                .map_err(|err| ParseError::PartParseFailed {
+                    bytes: player_bytes.to_owned(),
+                    ty: "u64",
+                    source: Some(Box::new(err)),
+                })?;
         }
-    
-        let port_ip = body_iter.next().ok_or(ParseError::Unspecified)?;
+
+        let port_ip = body_iter.next().ok_or(ParseError::UnexpectedEndOfData)?;
         if port_ip.len() < 3 {
-            return Err(ParseError::Unspecified);
+            return Err(ParseError::PartParseFailed {
+                bytes: port_ip.to_owned(),
+                ty: "Little-endian u16 and IpAddr Pair",
+                source: None,
+            });
         }
-        let host_port = u16::from_le_bytes(<[u8; 2]>::try_from(&port_ip[..2]).unwrap());
-        let host_ip_str = std::str::from_utf8(&port_ip[2..]).map_err(|_| ParseError::Unspecified)?;
-        let host_ip = host_ip_str.parse().map_err(|_| ParseError::Unspecified)?;
-        
+        let host_port = u16::from_le_bytes(port_ip[..2].try_into().unwrap());
+        let host_ip_str =
+            std::str::from_utf8(&port_ip[2..]).map_err(|err| ParseError::PartParseFailed {
+                bytes: port_ip[2..].to_owned(),
+                ty: "IpAddr",
+                source: Some(Box::new(err)),
+            })?;
+        let host_ip = host_ip_str
+            .parse()
+            .map_err(|err| ParseError::PartParseFailed {
+                bytes: port_ip[2..].to_owned(),
+                ty: "IpAddr",
+                source: Some(Box::new(err)),
+            })?;
+
         Ok(BasicStat {
             buf: result_buf,
             motd_end: end_indices[0],
@@ -310,7 +363,7 @@ impl FullStat {
     pub fn plugins(&self) -> &[u8] {
         &self.buf[self.version_end..self.plugins_end]
     }
-    
+
     pub fn map(&self) -> &[u8] {
         &self.buf[self.plugins_end..self.map_end]
     }
@@ -349,12 +402,23 @@ impl FullStat {
 
 impl ParseDatagram for FullStat {
     fn parse_datagram(session_id: Option<u32>, datagram: &[u8]) -> Result<Self, ParseError> {
-        if datagram.len() < 16
-            || datagram[0] != 0
-            || session_id.map(|id| id.to_be_bytes() != datagram[1..5]).unwrap_or(false)
-            || datagram[datagram.len()-2..] != [0, 0]
-        {
-            return Err(ParseError::Unspecified);
+        if datagram.len() < 16 {
+            return Err(ParseError::TooShort);
+        }
+        if datagram[0] != 0 {
+            return Err(ParseError::InvalidType {
+                expected: 0,
+                got: datagram[0],
+            });
+        }
+        if let Some(id) = session_id {
+            let got_id = u32::from_be_bytes(datagram[1..5].try_into().unwrap());
+            if id != got_id {
+                return Err(ParseError::SessionIdMismatch {
+                    expected: id,
+                    got: got_id,
+                });
+            }
         }
 
         let mut buf = Vec::new();
@@ -366,63 +430,88 @@ impl ParseDatagram for FullStat {
         let mut ends = [0; 6];
 
         macro_rules! parse_kv {
-            ($expected_key:expr, $do_with_value:expr) => {
-                {
-                    let key = kv_iter.next();
-                    if key != Some($expected_key) {
-                        return Err(ParseError::Unspecified);
-                    }
-                    let value = kv_iter.next();
-                    if let Some(value) = value {
-                        $do_with_value(value)
+            ($expected_key:expr, $do_with_value:expr) => {{
+                let key = kv_iter.next();
+                if key != Some($expected_key) {
+                    if let Some(key) = key {
+                        return Err(ParseError::UnexpectedKey {
+                            expected: $expected_key,
+                            got: key.to_owned(),
+                        });
                     } else {
-                        return Err(ParseError::Unspecified);
+                        return Err(ParseError::UnexpectedEndOfData);
                     }
                 }
-            };
+                let value = kv_iter.next();
+                if let Some(value) = value {
+                    $do_with_value(value)
+                } else {
+                    return Err(ParseError::UnexpectedEndOfData);
+                }
+            }};
             ($expected_key:expr, APPEND_TO_BUF, $idx:expr) => {
                 parse_kv!($expected_key, |value| {
                     buf.copy_from_slice(value);
                     ends[$idx] = buf.len();
                 })
             };
-            ($expected_key:expr, PARSE_AS, $tgt:ty) => {
+            ($expected_key:expr, PARSE_AS, $tgt:ty, $description:expr) => {
                 parse_kv!($expected_key, |value| {
                     std::str::from_utf8(value)
-                        .map_err(|_| ())
-                        .and_then(|value| {
-                            value.parse::<$tgt>().map_err(|_| ())
+                        .map_err(|err| ParseError::PartParseFailed {
+                            bytes: value.to_owned(),
+                            ty: $description,
+                            source: Some(Box::new(err)),
                         })
-                        .map_err(|_| ParseError::Unspecified)
+                        .and_then(|s| {
+                            s.parse::<$tgt>()
+                                .map_err(|err| ParseError::PartParseFailed {
+                                    bytes: value.to_owned(),
+                                    ty: $description,
+                                    source: Some(Box::new(err)),
+                                })
+                        })
                 })
-            }
+            };
         }
 
         parse_kv!(b"hostname", APPEND_TO_BUF, 0);
         parse_kv!(b"gametype", APPEND_TO_BUF, 1);
-        parse_kv!(b"game_id",  APPEND_TO_BUF, 2);
-        parse_kv!(b"version",  APPEND_TO_BUF, 3);
-        parse_kv!(b"plugins",  APPEND_TO_BUF, 4);
-        parse_kv!(b"map",      APPEND_TO_BUF, 5);
+        parse_kv!(b"game_id", APPEND_TO_BUF, 2);
+        parse_kv!(b"version", APPEND_TO_BUF, 3);
+        parse_kv!(b"plugins", APPEND_TO_BUF, 4);
+        parse_kv!(b"map", APPEND_TO_BUF, 5);
 
-        let num_players = parse_kv!(b"numplayers", PARSE_AS, u64)?;
-        let max_players = parse_kv!(b"maxplayers", PARSE_AS, u64)?;
-        let host_port = parse_kv!(b"hostport", PARSE_AS, u16)?;
-        let host_ip = parse_kv!(b"hostip", PARSE_AS, IpAddr)?;
-        
-        if kv_iter.next() != Some(b"") {
-            return Err(ParseError::Unspecified);
+        let num_players = parse_kv!(b"numplayers", PARSE_AS, u64, "u64")?;
+        let max_players = parse_kv!(b"maxplayers", PARSE_AS, u64, "u64")?;
+        let host_port = parse_kv!(b"hostport", PARSE_AS, u16, "u16")?;
+        let host_ip = parse_kv!(b"hostip", PARSE_AS, IpAddr, "IpAddr")?;
+
+        match kv_iter.next() {
+            Some(b"") => {}
+            Some(got) => {
+                return Err(ParseError::UnexpectedKey {
+                    expected: b"",
+                    got: got.to_owned(),
+                })
+            }
+            None => return Err(ParseError::UnexpectedEndOfData),
         }
-        
+
         let mut player_ends = Vec::with_capacity(num_players as usize);
         idx += 10;
+        let mut empty_player_found = false;
         let players_iter = datagram[idx..].split(|&b| b == 0);
         for player in players_iter {
             if player == b"" {
+                empty_player_found = true;
                 break;
             }
             buf.copy_from_slice(player);
             player_ends.push(buf.len());
+        }
+        if !empty_player_found {
+            return Err(ParseError::UnexpectedEndOfData);
         }
 
         Ok(FullStat {
