@@ -104,17 +104,22 @@ impl Querier {
         }
     }
 
-    pub fn basic_stat(&mut self) -> Result<BasicStat, Error> {
+    fn stat<BUF, OUT>(&mut self) -> Result<OUT, Error>
+    where
+        BUF: AsMut<[u8]> + Default,
+        OUT: ParseData,
+    {
         let mut token = self.last_token.ok_or(()).or_else(|_| self.handshake())?;
 
-        let mut request = [0; 11];
+        let mut request = <BUF>::default();
+        let request = request.as_mut();
         request[0] = 0xfe;
         request[1] = 0xfd;
 
         loop {
             request[3..7].copy_from_slice(&self.session_id.to_be_bytes());
             request[7..11].copy_from_slice(&token.to_be_bytes());
-            self.sock.send(&request)?;
+            self.sock.send(&*request)?;
             let len = match self.sock.recv(&mut self.buf[..]) {
                 Ok(len) => len,
                 Err(e) => {
@@ -134,8 +139,16 @@ impl Querier {
             self.reset_retry_counter();
             self.last_token = Some(token);
             println!("{:?}", &self.buf[..len]);
-            return Ok(BasicStat::parse_data(self.session_id, &self.buf[..len])?);
+            return Ok(<OUT>::parse_data(self.session_id, &self.buf[..len])?);
         }
+    }
+
+    pub fn basic_stat(&mut self) -> Result<BasicStat, Error> {
+        self.stat::<[u8; 11], BasicStat>()
+    }
+
+    pub fn full_stat(&mut self) -> Result<FullStat, Error> {
+        self.stat::<[u8; 15], FullStat>()
     }
 }
 
@@ -151,6 +164,36 @@ pub struct BasicStat {
 }
 
 impl BasicStat {
+    pub fn motd(&self) -> &[u8] {
+        &self.buf[..self.motd_end]
+    }
+
+    pub fn gametype(&self) -> &[u8] {
+        &self.buf[self.motd_end..self.gametype_end]
+    }
+
+    pub fn map(&self) -> &[u8] {
+        &self.buf[self.gametype_end..]
+    }
+
+    pub fn num_players(&self) -> u64 {
+        self.num_players
+    }
+
+    pub fn max_players(&self) -> u64 {
+        self.max_players
+    }
+
+    pub fn host_port(&self) -> u16 {
+        self.host_port
+    }
+
+    pub fn host_ip(&self) -> IpAddr {
+        self.host_ip
+    }
+}
+
+impl ParseData for BasicStat {
     fn parse_data(session_id: u32, data: &[u8]) -> Result<Self, ParseError> {
         if data.len() < 13 {
             return Err(ParseError::Unspecified);
@@ -201,34 +244,6 @@ impl BasicStat {
             host_ip,
         })
     }
-
-    pub fn motd(&self) -> &[u8] {
-        &self.buf[..self.motd_end]
-    }
-
-    pub fn gametype(&self) -> &[u8] {
-        &self.buf[self.motd_end..self.gametype_end]
-    }
-
-    pub fn map(&self) -> &[u8] {
-        &self.buf[self.gametype_end..]
-    }
-
-    pub fn num_players(&self) -> u64 {
-        self.num_players
-    }
-
-    pub fn max_players(&self) -> u64 {
-        self.max_players
-    }
-
-    pub fn host_port(&self) -> u16 {
-        self.host_port
-    }
-
-    pub fn host_ip(&self) -> IpAddr {
-        self.host_ip
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -248,6 +263,67 @@ pub struct FullStat {
 }
 
 impl FullStat {
+    pub fn motd(&self) -> &[u8] {
+        self.hostname()
+    }
+
+    pub fn hostname(&self) -> &[u8] {
+        &self.buf[..self.hostname_end]
+    }
+
+    pub fn gametype(&self) -> &[u8] {
+        &self.buf[self.hostname_end..self.gametype_end]
+    }
+
+    pub fn gameid(&self) -> &[u8] {
+        &self.buf[self.gametype_end..self.gameid_end]
+    }
+
+    pub fn version(&self) -> &[u8] {
+        &self.buf[self.gameid_end..self.version_end]
+    }
+
+    pub fn plugins(&self) -> &[u8] {
+        &self.buf[self.version_end..self.plugins_end]
+    }
+    
+    pub fn map(&self) -> &[u8] {
+        &self.buf[self.plugins_end..self.map_end]
+    }
+
+    pub fn reported_num_players(&self) -> u64 {
+        self.num_players
+    }
+
+    pub fn num_players(&self) -> usize {
+        self.player_ends.len()
+    }
+
+    pub fn max_players(&self) -> u64 {
+        self.max_players
+    }
+
+    pub fn host_ip(&self) -> IpAddr {
+        self.host_ip
+    }
+
+    pub fn host_port(&self) -> u16 {
+        self.host_port
+    }
+
+    pub fn player(&self, idx: usize) -> Option<&[u8]> {
+        self.player_ends.get(idx).map(|&end| {
+            let start = if idx == 0 {
+                self.map_end
+            } else {
+                self.player_ends[idx - 1]
+            };
+            &self.buf[start..end]
+        })
+    }
+}
+
+impl ParseData for FullStat {
     fn parse_data(session_id: u32, data: &[u8]) -> Result<Self, ParseError> {
         if data.len() < 16 || data[0] != 0 || data[1..5] != session_id.to_be_bytes()
             || data[data.len()-2..] != [0, 0]
@@ -338,4 +414,8 @@ impl FullStat {
             player_ends,
         })
     }
+}
+
+trait ParseData: Sized {
+    fn parse_data(session_id: u32, data: &[u8]) -> Result<Self, ParseError>;
 }
