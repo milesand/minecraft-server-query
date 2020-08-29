@@ -9,6 +9,47 @@ mod error;
 
 use error::{Error, ParseError};
 
+macro_rules! parse_bytes_as {
+    ($bytes:expr, $ty:ty, NONE, $description:expr) => {
+        {
+            macro_rules! handle_err {
+                () => {
+                    |err| {
+                        ParseError::PartParseFailed {
+                            bytes: $bytes.to_owned(),
+                            ty: $description,
+                            source: Some(Box::new(err)),
+                        }
+                    }
+                };
+            }
+            let utf8 = std::str::from_utf8($bytes).map_err(handle_err!())?;
+            utf8.parse::<$ty>().map_err(handle_err!())
+        }
+    };
+    ($bytes:expr, $ty:ty, $iter:expr, $description:expr) => {
+        {
+            macro_rules! handle_err {
+                () => {
+                    |err| {
+                        if $iter.next().is_some() {
+                            ParseError::PartParseFailed {
+                                bytes: $bytes.to_owned(),
+                                ty: $description,
+                                source: Some(Box::new(err)),
+                            }
+                        } else {
+                            ParseError::UnexpectedEndOfData
+                        }
+                    }
+                };
+            }
+            let utf8 = std::str::from_utf8($bytes).map_err(handle_err!())?;
+            utf8.parse::<$ty>().map_err(handle_err!())
+        }
+    };
+}
+
 #[derive(Debug)]
 pub struct Querier {
     sock: UdpSocket,
@@ -28,7 +69,7 @@ impl Querier {
             session_id: 0,
             last_token: None,
             max_retries: None,
-            buf: vec![0; 1024],
+            buf: vec![0; 1500],
         })
     }
 
@@ -102,20 +143,8 @@ impl Querier {
                 return Err(ParseError::UnexpectedEndOfData.into());
             }
 
-            let token_str = std::str::from_utf8(&buf[5..len - 1]).map_err(|err| {
-                ParseError::PartParseFailed {
-                    bytes: buf[5..len - 1].to_owned(),
-                    ty: "i32",
-                    source: Some(Box::new(err)),
-                }
-            })?;
-            let token = token_str
-                .parse::<i32>()
-                .map_err(|err| ParseError::PartParseFailed {
-                    bytes: buf[5..len - 1].to_owned(),
-                    ty: "i32",
-                    source: Some(Box::new(err)),
-                })?;
+            let token_bytes = &buf[5..len - 1];
+            let token = parse_bytes_as!(token_bytes, i32, NONE, "i32")?;
 
             return Ok(token);
         }
@@ -139,7 +168,7 @@ impl Querier {
             request[3..7].copy_from_slice(&self.session_id.to_be_bytes());
             request[7..11].copy_from_slice(&token.to_be_bytes());
             self.sock.send(&*request)?;
-            let len = match self.sock.recv(&mut self.buf[..]) {
+            let mut len = match self.sock.peek(&mut self.buf[..]) {
                 Ok(len) => len,
                 Err(e) => {
                     match self.max_retries {
@@ -160,11 +189,29 @@ impl Querier {
             };
 
             self.last_token = Some(token);
-            println!("{:?}", &self.buf[..len]);
-            return Ok(<OUT>::parse_datagram(
-                Some(self.session_id),
-                &self.buf[..len],
-            )?);
+
+            loop {
+                let ret = <OUT>::parse_datagram(
+                    Some(self.session_id),
+                    &self.buf[..len],
+                );
+
+                match ret {
+                    Ok(ret) => {
+                        self.sock.recv(&mut self.buf[..])?;
+                        return Ok(ret);
+                    },
+                    Err(ParseError::UnexpectedEndOfData) if len == self.buf.len() => {
+                        self.buf.resize(self.buf.len() * 2, 0);
+                        len = self.sock.peek(&mut self.buf[..])?;
+                        continue;
+                    },
+                    Err(err) => {
+                        self.sock.recv(&mut self.buf[..])?;
+                        return Err(err.into());
+                    },
+                }
+            }
         }
     }
 
@@ -260,19 +307,7 @@ impl ParseDatagram for BasicStat {
         let mut players = [0; 2];
         for player in &mut players {
             let player_bytes = body_iter.next().ok_or(ParseError::UnexpectedEndOfData)?;
-            let player_str =
-                std::str::from_utf8(player_bytes).map_err(|err| ParseError::PartParseFailed {
-                    bytes: player_bytes.to_owned(),
-                    ty: "u64",
-                    source: Some(Box::new(err)),
-                })?;
-            *player = player_str
-                .parse()
-                .map_err(|err| ParseError::PartParseFailed {
-                    bytes: player_bytes.to_owned(),
-                    ty: "u64",
-                    source: Some(Box::new(err)),
-                })?;
+            *player = parse_bytes_as!(player_bytes, u64, body_iter, "u64")?;
         }
 
         let port_ip = body_iter.next().ok_or(ParseError::UnexpectedEndOfData)?;
@@ -284,19 +319,17 @@ impl ParseDatagram for BasicStat {
             });
         }
         let host_port = u16::from_le_bytes(port_ip[..2].try_into().unwrap());
-        let host_ip_str =
-            std::str::from_utf8(&port_ip[2..]).map_err(|err| ParseError::PartParseFailed {
-                bytes: port_ip[2..].to_owned(),
+        let host_ip_bytes = &port_ip[2..];
+        // Maximum length of valid string representation of IpAddr seems to be 45 bytes.
+        // Reject anything longer than that.
+        if host_ip_bytes.len() > 45 {
+            return Err(ParseError::PartParseFailed { 
+                bytes: host_ip_bytes.to_owned(),
                 ty: "IpAddr",
-                source: Some(Box::new(err)),
-            })?;
-        let host_ip = host_ip_str
-            .parse()
-            .map_err(|err| ParseError::PartParseFailed {
-                bytes: port_ip[2..].to_owned(),
-                ty: "IpAddr",
-                source: Some(Box::new(err)),
-            })?;
+                source: None,
+            });
+        }
+        let host_ip = parse_bytes_as!(host_ip_bytes, IpAddr, body_iter, "IpAddr")?;
 
         Ok(BasicStat {
             buf: result_buf,
@@ -442,22 +475,21 @@ impl ParseDatagram for FullStat {
                     ends[$idx] = buf.len();
                 })
             };
-            ($expected_key:expr, PARSE_AS, $tgt:ty, $description:expr) => {
+            ($expected_key:expr, PARSE_AS, $ty:ty, $description:expr) => {
                 parse_kv!($expected_key, |value| {
-                    std::str::from_utf8(value)
-                        .map_err(|err| ParseError::PartParseFailed {
+                    parse_bytes_as!(value, $ty, kv_iter, $description)
+                })
+            };
+            ($expected_key:expr, PARSE_AS, $ty:ty, $description:expr, MAX_LEN, $maxlen:expr) => {
+                parse_kv!($expected_key, |value: &[u8]| {
+                    if value.len() > $maxlen {
+                        return Err(ParseError::PartParseFailed {
                             bytes: value.to_owned(),
                             ty: $description,
-                            source: Some(Box::new(err)),
-                        })
-                        .and_then(|s| {
-                            s.parse::<$tgt>()
-                                .map_err(|err| ParseError::PartParseFailed {
-                                    bytes: value.to_owned(),
-                                    ty: $description,
-                                    source: Some(Box::new(err)),
-                                })
-                        })
+                            source: None,
+                        });
+                    }
+                    parse_bytes_as!(value, $ty, kv_iter, $description)
                 })
             };
         }
@@ -472,7 +504,7 @@ impl ParseDatagram for FullStat {
         let num_players = parse_kv!(b"numplayers", PARSE_AS, u64, "u64")?;
         let max_players = parse_kv!(b"maxplayers", PARSE_AS, u64, "u64")?;
         let host_port = parse_kv!(b"hostport", PARSE_AS, u16, "u16")?;
-        let host_ip = parse_kv!(b"hostip", PARSE_AS, IpAddr, "IpAddr")?;
+        let host_ip = parse_kv!(b"hostip", PARSE_AS, IpAddr, "IpAddr", MAX_LEN, 45)?;
 
         match kv_iter.next() {
             Some(b"") => {}
