@@ -14,13 +14,8 @@ pub struct Querier {
     sock: UdpSocket,
     session_id: u32,
     last_token: Option<i32>,
-    retries: Option<Retries>,
+    max_retries: Option<u32>,
     buf: Vec<u8>,
-}
-#[derive(Copy, Clone, Debug)]
-struct Retries {
-    pub max: u64,
-    pub current: u64,
 }
 
 impl Querier {
@@ -32,7 +27,7 @@ impl Querier {
             sock,
             session_id: 0,
             last_token: None,
-            retries: Some(Retries { max: 3, current: 0 }),
+            max_retries: None,
             buf: vec![0; 1024],
         })
     }
@@ -41,30 +36,12 @@ impl Querier {
         self.session_id = self.session_id.wrapping_add(1);
     }
 
-    fn should_retry(&mut self) -> bool {
-        if let Some(ref mut retries) = self.retries {
-            retries.current += 1;
-            retries.max > retries.current
-        } else {
-            true
-        }
+    pub fn set_max_retries(&mut self, max_retries: Option<u32>) {
+        self.max_retries = max_retries;
     }
 
-    fn reset_retry_counter(&mut self) {
-        if let Some(ref mut retries) = self.retries {
-            retries.current = 0;
-        }
-    }
-
-    pub fn set_max_retries(&mut self, max_retries: Option<u64>) {
-        if max_retries == Some(0) {
-            panic!("set_max_retries called with max_retries == Some(0)");
-        }
-        self.retries = max_retries.map(|max| Retries { max, current: 0 });
-    }
-
-    pub fn max_retries(&self) -> Option<u64> {
-        self.retries.map(|r| r.max)
+    pub fn max_retries(&self) -> Option<u32> {
+        self.max_retries
     }
 
     pub fn set_timeout(&mut self, dur: Duration) -> Result<(), io::Error> {
@@ -83,22 +60,25 @@ impl Querier {
         };
 
         let mut buf = [0; 17];
-
+        let mut retries = 0;
         loop {
             self.sock.send(&request)?;
             let len = match self.sock.recv(&mut buf) {
                 Ok(len) => len,
                 Err(e) => {
-                    use io::ErrorKind::*;
-                    if [WouldBlock, TimedOut].contains(&e.kind()) && self.should_retry() {
-                        continue;
+                    match self.max_retries() {
+                        Some(max_retries) if max_retries <= retries => {},                        
+                        _ => {
+                            use io::ErrorKind::*;
+                            if [WouldBlock, TimedOut].contains(&e.kind()) {
+                                retries += 1;
+                                continue;
+                            }
+                        },
                     }
-                    self.reset_retry_counter();
                     return Err(e.into());
                 }
             };
-
-            self.reset_retry_counter();
 
             match buf.get(0).copied() {
                 Some(9) => {}
@@ -153,6 +133,8 @@ impl Querier {
         request[0] = 0xfe;
         request[1] = 0xfd;
 
+        let mut retries = 0;
+
         loop {
             request[3..7].copy_from_slice(&self.session_id.to_be_bytes());
             request[7..11].copy_from_slice(&token.to_be_bytes());
@@ -160,18 +142,23 @@ impl Querier {
             let len = match self.sock.recv(&mut self.buf[..]) {
                 Ok(len) => len,
                 Err(e) => {
-                    use io::ErrorKind::*;
-                    if [WouldBlock, TimedOut].contains(&e.kind()) && self.should_retry() {
-                        self.generate_new_session_id();
-                        self.last_token = None;
-                        token = self.handshake()?;
-                        continue;
+                    match self.max_retries {
+                        Some(max_retries) if max_retries <= retries => {},
+                        _ => {
+                            use io::ErrorKind::*;
+                            if [WouldBlock, TimedOut].contains(&e.kind()) {
+                                self.generate_new_session_id();
+                                self.last_token = None;
+                                token = self.handshake()?;
+                                retries += 1;
+                                continue;
+                            }
+                        }
                     }
-                    self.reset_retry_counter();
                     return Err(e.into());
                 }
             };
-            self.reset_retry_counter();
+
             self.last_token = Some(token);
             println!("{:?}", &self.buf[..len]);
             return Ok(<OUT>::parse_datagram(
