@@ -5,9 +5,11 @@ use std::io;
 use std::net::{IpAddr, ToSocketAddrs, UdpSocket};
 use std::time::Duration;
 
-mod error;
-
+pub mod error;
 use error::{Error, ParseError};
+
+mod session;
+pub use session::SessionId;
 
 macro_rules! parse_bytes_as {
     ($bytes:expr, $ty:ty, NONE, $description:expr) => {
