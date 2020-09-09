@@ -12,10 +12,12 @@ pub enum Error {
 pub enum ParseError {
     #[error("Datagram was too short to be valid")]
     TooShort,
+    #[error("Datagram was too long to be valid")]
+    TooLong,
     #[error("Expected type byte {}, got {} instead", .expected, .got)]
     InvalidType { expected: u8, got: u8 },
-    #[error("Expected Session ID {}, got {} instead", .expected, .got)]
-    SessionIdMismatch { expected: u32, got: u32 },
+    #[error("Session ID {:?} was not UTF-8", <&BStr>::from(&.got[..]))]
+    InvalidSessionId { got: [u8; 4] },
     #[error("Datagram ended unexpectedly")]
     UnexpectedEndOfData,
     #[error("Failed to parse {:?} as {}", <&BStr>::from(.bytes.as_slice()), .ty)]
@@ -30,4 +32,6 @@ pub enum ParseError {
         expected: &'static [u8],
         got: Vec<u8>,
     },
+    #[error("Unspecified error")]
+    Unspecified,
 }

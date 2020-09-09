@@ -17,6 +17,10 @@ impl SessionId {
     pub fn new() -> SessionId {
         SessionId([0, 0, 0, 0])
     }
+
+    pub fn inner(&self) -> &[u8; 4] {
+        &self.0
+    }
 }
 
 impl From<u16> for SessionId {

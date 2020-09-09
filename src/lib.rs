@@ -1,6 +1,6 @@
 //! [Query Protocol](https://wiki.vg/Query), used for querying the status of a minecraft server.
 
-use std::convert::TryInto;
+use std::convert::{TryFrom, TryInto};
 use std::io;
 use std::net::{IpAddr, ToSocketAddrs, UdpSocket};
 use std::time::Duration;
@@ -10,6 +10,10 @@ use error::{Error, ParseError};
 
 mod session;
 pub use session::SessionId;
+
+const MAGIC: [u8; 2] = [0xfe, 0xfd];
+const TYPE_HANDSHAKE: u8 = 0x09;
+const TYPE_STAT: u8 = 0x00;
 
 macro_rules! parse_bytes_as {
     ($bytes:expr, $ty:ty, NONE, $description:expr) => {
@@ -52,10 +56,74 @@ macro_rules! parse_bytes_as {
     };
 }
 
+/// Constructs a handshake request that may be sent to the server.
+pub fn handshake_request(id: SessionId) -> [u8; 7] {
+    let mut datagram = [0; 7];
+    datagram[0..2].copy_from_slice(&MAGIC);
+    datagram[2] = TYPE_HANDSHAKE;
+    datagram[3..7].copy_from_slice(id.inner());
+    datagram
+}
+
+/// Constructs a basic stat request that may be sent to the server.
+pub fn basic_stat_request(id: SessionId, token: i32) -> [u8; 11] {
+    let mut datagram = [0; 11];
+    datagram[0..2].copy_from_slice(&MAGIC);
+    datagram[2] = TYPE_STAT;
+    datagram[3..7].copy_from_slice(id.inner());
+    datagram[7..11].copy_from_slice(&token.to_be_bytes());
+    datagram
+}
+
+/// Constructs a full stat request that may be sent to the server.
+pub fn full_stat_request(id: SessionId, token: i32) -> [u8; 15] {
+    let mut datagram = [0; 15];
+    datagram[0..2].copy_from_slice(&MAGIC);
+    datagram[2] = TYPE_STAT;
+    datagram[3..7].copy_from_slice(id.inner());
+    datagram[7..11].copy_from_slice(&token.to_be_bytes());
+    // [11..15] works as padding. Per documentation, Minecraft distinguishes basic and full stat request by request length.
+    datagram
+}
+
+/// Parse the handshake response received from the server and return (Challenge Token, Session ID) pair.
+pub fn parse_handshake_response(response: &[u8]) -> Result<(i32, SessionId), ParseError> {
+    // Response datagram looks like this:
+    // +---------------------------------------------------+
+    // |  Type  | Session ID | Challenge token | Null byte |
+    // | 1 byte |  4 bytes   | Variable length |  1 byte   |
+    // +---------------------------------------------------+
+    // The challenge token is a string representing a 32bit signed int, So its at least 1 byte long (for single digit),
+    // and at most 11 bytes long (10 digits + negative sign). Thus, a valid response is at leat 7 bytes long, and at
+    // most 17 bytes long.
+    if response.len() < 7 {
+        return Err(ParseError::TooShort);
+    }
+    if response.len() > 17 {
+        return Err(ParseError::TooLong);
+    }
+    // The first byte should be TYPE_HANDSHAKE.
+    if response[0] != TYPE_HANDSHAKE {
+        return Err(ParseError::InvalidType { expected: TYPE_HANDSHAKE, got: response[0] });
+    }
+    // The last byte should be NULL.
+    if response[response.len() - 1] != 0 {
+        return Err(ParseError::Unspecified);
+    }
+
+    let id_bytes = <[u8; 4]>::try_from(&response[1..5]).unwrap();
+    let id = SessionId::try_from(id_bytes)
+        .map_err(|_| ParseError::InvalidSessionId { got: id_bytes })?;
+    
+    let token_bytes = &response[5..response.len() - 1];
+    let token = parse_bytes_as!(token_bytes, i32, NONE, "i32")?;
+
+    Ok((token, id))
+}
+
 #[derive(Debug)]
 pub struct Querier {
     sock: UdpSocket,
-    session_id: u32,
     last_token: Option<i32>,
     max_retries: Option<u32>,
     buf: Vec<u8>,
@@ -68,15 +136,10 @@ impl Querier {
         sock.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
         Ok(Querier {
             sock,
-            session_id: 0,
             last_token: None,
             max_retries: None,
             buf: vec![0; 1500],
         })
-    }
-
-    fn generate_new_session_id(&mut self) {
-        self.session_id = self.session_id.wrapping_add(1);
     }
 
     pub fn set_max_retries(&mut self, max_retries: Option<u32>) {
@@ -96,11 +159,7 @@ impl Querier {
     }
 
     fn handshake(&mut self) -> Result<i32, Error> {
-        let request = {
-            let mut request = [0xfe, 0xfd, 0x09, 0x00, 0x00, 0x00, 0x00];
-            request[3..].copy_from_slice(&self.session_id.to_be_bytes());
-            request
-        };
+        let request = handshake_request(SessionId::new());
 
         let mut buf = [0; 17];
         let mut retries = 0;
@@ -123,53 +182,28 @@ impl Querier {
                 }
             };
 
-            match buf.get(0).copied() {
-                Some(9) => {}
-                Some(got) => return Err(ParseError::InvalidType { expected: 9, got }.into()),
-                None => return Err(ParseError::UnexpectedEndOfData.into()),
-            }
-            match buf.get(1..5) {
-                Some(session) if session == self.session_id.to_be_bytes() => {}
-                Some(got_bytes) => {
-                    let got = u32::from_be_bytes(got_bytes.try_into().unwrap());
-                    return Err(ParseError::SessionIdMismatch {
-                        expected: self.session_id,
-                        got,
-                    }
-                    .into());
-                }
-                None => return Err(ParseError::UnexpectedEndOfData.into()),
-            }
-
-            if len < 6 || buf[len - 1] != 0 {
-                return Err(ParseError::UnexpectedEndOfData.into());
-            }
-
-            let token_bytes = &buf[5..len - 1];
-            let token = parse_bytes_as!(token_bytes, i32, NONE, "i32")?;
-
-            return Ok(token);
+            return parse_handshake_response(&buf[..len])
+                .map(|(token, _)| token)
+                .map_err(|e| e.into());
         }
     }
 
-    fn stat<BUF, OUT>(&mut self) -> Result<OUT, Error>
+    fn stat<REQ, OUT>(
+        &mut self,
+        req: fn(SessionId, i32) -> REQ,
+        parser: fn(&[u8]) -> Result<OUT, ParseError>
+    ) -> Result<OUT, Error>
     where
-        BUF: AsMut<[u8]> + Default,
+        REQ: AsRef<[u8]>,
         OUT: ParseDatagram,
     {
         let mut token = self.last_token.ok_or(()).or_else(|_| self.handshake())?;
 
-        let mut request = <BUF>::default();
-        let request = request.as_mut();
-        request[0] = 0xfe;
-        request[1] = 0xfd;
-
         let mut retries = 0;
 
         loop {
-            request[3..7].copy_from_slice(&self.session_id.to_be_bytes());
-            request[7..11].copy_from_slice(&token.to_be_bytes());
-            self.sock.send(&*request)?;
+            let request = req(SessionId::new(), token);
+            self.sock.send(request.as_ref())?;
             let mut len = match self.sock.peek(&mut self.buf[..]) {
                 Ok(len) => len,
                 Err(e) => {
@@ -178,7 +212,6 @@ impl Querier {
                         _ => {
                             use io::ErrorKind::*;
                             if [WouldBlock, TimedOut].contains(&e.kind()) {
-                                self.generate_new_session_id();
                                 self.last_token = None;
                                 token = self.handshake()?;
                                 retries += 1;
@@ -550,8 +583,4 @@ impl ParseDatagram for FullStat {
             player_ends,
         })
     }
-}
-
-trait ParseDatagram: Sized {
-    fn parse_datagram(session_id: Option<u32>, datagram: &[u8]) -> Result<Self, ParseError>;
 }
