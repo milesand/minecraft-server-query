@@ -34,7 +34,7 @@ pub fn handshake_request(id: SessionId) -> [u8; 7] {
     let mut datagram = [0; 7];
     datagram[0..2].copy_from_slice(&MAGIC);
     datagram[2] = TYPE_HANDSHAKE;
-    datagram[3..7].copy_from_slice(id.inner());
+    datagram[3..7].copy_from_slice(&id.inner());
     datagram
 }
 
@@ -43,7 +43,7 @@ pub fn basic_stat_request(id: SessionId, token: i32) -> [u8; 11] {
     let mut datagram = [0; 11];
     datagram[0..2].copy_from_slice(&MAGIC);
     datagram[2] = TYPE_STAT;
-    datagram[3..7].copy_from_slice(id.inner());
+    datagram[3..7].copy_from_slice(&id.inner());
     datagram[7..11].copy_from_slice(&token.to_be_bytes());
     datagram
 }
@@ -53,7 +53,7 @@ pub fn full_stat_request(id: SessionId, token: i32) -> [u8; 15] {
     let mut datagram = [0; 15];
     datagram[0..2].copy_from_slice(&MAGIC);
     datagram[2] = TYPE_STAT;
-    datagram[3..7].copy_from_slice(id.inner());
+    datagram[3..7].copy_from_slice(&id.inner());
     datagram[7..11].copy_from_slice(&token.to_be_bytes());
     // [11..15] works as padding. Per documentation, Minecraft distinguishes basic and full stat request by request length.
     datagram
@@ -71,7 +71,7 @@ fn is_valid_partial_session_id(id: &[u8]) -> bool {
     }
 }
 
-/// Parse the handshake response received from the server into a (Challenge Token, Session ID) pair.
+/// Parses the handshake response received from the server into a (Challenge Token, Session ID) pair.
 pub fn parse_handshake_response(response: &[u8]) -> Result<(i32, SessionId), ParseError> {
     // handshake response datagram looks like this:
     // * Type (1 byte); should be 0x09
@@ -127,6 +127,7 @@ pub fn parse_handshake_response(response: &[u8]) -> Result<(i32, SessionId), Par
     Ok((token, id))
 }
 
+/// Parses the basic stat response received from the server into a (Stat result, Session ID) pair.
 pub fn parse_basic_stat_response(response: &[u8]) -> Result<(BasicStat, SessionId), ParseError> {
     // handshake response datagram looks like this:
     // * Type (1 byte); should be 0x00
@@ -238,6 +239,7 @@ pub fn parse_basic_stat_response(response: &[u8]) -> Result<(BasicStat, SessionI
     Ok((stat, id))
 }
 
+/// Parses the full stat response received from the server into a (Stat result, Session ID) pair.
 pub fn parse_full_stat_response(response: &[u8]) -> Result<(FullStat, SessionId), ParseError> {
     // handshake response datagram looks like this:
     // * Type (1 byte); should be 0x00
