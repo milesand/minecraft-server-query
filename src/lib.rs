@@ -15,45 +15,18 @@ const MAGIC: [u8; 2] = [0xfe, 0xfd];
 const TYPE_HANDSHAKE: u8 = 0x09;
 const TYPE_STAT: u8 = 0x00;
 
-macro_rules! parse_bytes_as {
-    ($bytes:expr, $ty:ty, NONE, $description:expr) => {
-        {
-            macro_rules! handle_err {
-                () => {
-                    |err| {
-                        ParseError::PartParseFailed {
-                            bytes: $bytes.to_owned(),
-                            ty: $description,
-                            source: Some(Box::new(err)),
-                        }
-                    }
-                };
-            }
-            let utf8 = std::str::from_utf8($bytes).map_err(handle_err!())?;
-            utf8.parse::<$ty>().map_err(handle_err!())
-        }
-    };
-    ($bytes:expr, $ty:ty, $iter:expr, $description:expr) => {
-        {
-            macro_rules! handle_err {
-                () => {
-                    |err| {
-                        if $iter.next().is_some() {
-                            ParseError::PartParseFailed {
-                                bytes: $bytes.to_owned(),
-                                ty: $description,
-                                source: Some(Box::new(err)),
-                            }
-                        } else {
-                            ParseError::UnexpectedEndOfData
-                        }
-                    }
-                };
-            }
-            let utf8 = std::str::from_utf8($bytes).map_err(handle_err!())?;
-            utf8.parse::<$ty>().map_err(handle_err!())
-        }
-    };
+const MAX_IPADDR_LEN: usize = 45;
+
+enum ParseByteError<E> {
+    Utf8(std::str::Utf8Error),
+    Parse(E),
+}
+
+// A helper for parsing data from bytes.
+fn parse_bytes<T: std::str::FromStr>(bytes: &[u8]) -> Result<T, ParseByteError<T::Err>> {
+    std::str::from_utf8(bytes)
+        .map_err(ParseByteError::Utf8)
+        .and_then(|s| s.parse::<T>().map_err(ParseByteError::Parse))
 }
 
 /// Constructs a handshake request that may be sent to the server.
@@ -86,40 +59,347 @@ pub fn full_stat_request(id: SessionId, token: i32) -> [u8; 15] {
     datagram
 }
 
-/// Parse the handshake response received from the server and return (Challenge Token, Session ID) pair.
+// Check if this partial session id is a valid prefix of complete session id.
+fn is_valid_partial_session_id(id: &[u8]) -> bool {
+    debug_assert!(id.len() <= 3);
+    if id.is_empty() {
+        return true;
+    }
+    match std::str::from_utf8(id) {
+        Ok(_) => true,
+        Err(e) => e.error_len().is_none(),
+    }
+}
+
+/// Parse the handshake response received from the server into a (Challenge Token, Session ID) pair.
 pub fn parse_handshake_response(response: &[u8]) -> Result<(i32, SessionId), ParseError> {
-    // Response datagram looks like this:
-    // +---------------------------------------------------+
-    // |  Type  | Session ID | Challenge token | Null byte |
-    // | 1 byte |  4 bytes   | Variable length |  1 byte   |
-    // +---------------------------------------------------+
-    // The challenge token is a string representing a 32bit signed int, So its at least 1 byte long (for single digit),
-    // and at most 11 bytes long (10 digits + negative sign). Thus, a valid response is at leat 7 bytes long, and at
-    // most 17 bytes long.
-    if response.len() < 7 {
-        return Err(ParseError::TooShort);
+    // handshake response datagram looks like this:
+    // * Type (1 byte); should be 0x09
+    // * Session ID (4 bytes)
+    // * Challenge Token (Null-terminated string)
+    // Where Challenge Token is a decimal string representation of 32-bit signed integer.
+
+    let malformed = || ParseError::MalformedInput {
+        requested_kind: "handshake response",
+    };
+
+    // Check Type
+    if response.is_empty() {
+        return Err(ParseError::UnexpectedEndOfInput);
     }
-    if response.len() > 17 {
-        return Err(ParseError::TooLong);
-    }
-    // The first byte should be TYPE_HANDSHAKE.
     if response[0] != TYPE_HANDSHAKE {
-        return Err(ParseError::InvalidType { expected: TYPE_HANDSHAKE, got: response[0] });
-    }
-    // The last byte should be NULL.
-    if response[response.len() - 1] != 0 {
-        return Err(ParseError::Unspecified);
+        return Err(malformed());
     }
 
+    // Parse Session ID
+    if response.len() < 5 {
+        return Err(if is_valid_partial_session_id(&response[1..]) {
+            ParseError::UnexpectedEndOfInput
+        } else {
+            malformed()
+        });
+    }
     let id_bytes = <[u8; 4]>::try_from(&response[1..5]).unwrap();
-    let id = SessionId::try_from(id_bytes)
-        .map_err(|_| ParseError::InvalidSessionId { got: id_bytes })?;
-    
-    let token_bytes = &response[5..response.len() - 1];
-    let token = parse_bytes_as!(token_bytes, i32, NONE, "i32")?;
+    let id = SessionId::try_from(id_bytes).map_err(|_| malformed())?;
+
+    // Parse Challenge Token
+    if response.len() == 5 {
+        // The whole challenge token is missing; Input up until now was valid.
+        return Err(ParseError::UnexpectedEndOfInput);
+    }
+    if response[response.len() - 1] != 0 {
+        // Missing null terminator
+        return Err(
+            // Check if the remaining part looks like a valid prefix of i32;
+            // that is, a single negative sign, or just i32.
+            if (response.len() == 6 && response[5] == b'-')
+                || parse_bytes::<i32>(&response[5..response.len()]).is_ok()
+            {
+                ParseError::UnexpectedEndOfInput
+            } else {
+                malformed()
+            },
+        );
+    }
+
+    let token = parse_bytes::<i32>(&response[5..response.len() - 1]).map_err(|_| malformed())?;
 
     Ok((token, id))
 }
+
+pub fn parse_basic_stat_response(response: &[u8]) -> Result<(BasicStat, SessionId), ParseError> {
+    // handshake response datagram looks like this:
+    // * Type (1 byte); should be 0x00
+    // * Session ID (4 bytes)
+    // * MOTD (Null-terminated string)
+    // * Gametype (Null-terminated string)
+    // * Map (Null-terminated string)
+    // * Current number of players (Null-terminated string)
+    // * Maximum number of players (Null-terminated string)
+    // * Host port (Little endian, 16 bit)
+    // * Host IP (Null-terminated string)
+    //
+    // Here we assume:
+    // * Current/Maximum number of players can be parsed into `u32`
+    //   * The Minecraft Wiki states that the maximum value `max-players` property can have is 2^31-1
+    //     (for Java Edition), and for obvious reason it is never negative, so it seems okay to assume
+    //     any valid player count will fall in the range covered by u32.
+    // * Host IP can be parsed into `IpAddr`
+
+    let malformed = || ParseError::MalformedInput {
+        requested_kind: "basic stat response",
+    };
+
+    // Check Type
+    if response.is_empty() {
+        return Err(ParseError::UnexpectedEndOfInput);
+    }
+    if response[0] != TYPE_STAT {
+        return Err(malformed());
+    }
+
+    // Parse Session ID
+    if response.len() < 5 {
+        return Err(if is_valid_partial_session_id(&response[1..]) {
+            ParseError::UnexpectedEndOfInput
+        } else {
+            malformed()
+        });
+    }
+    let id_bytes = <[u8; 4]>::try_from(&response[1..5]).unwrap();
+    let id = SessionId::try_from(id_bytes).map_err(|_| malformed())?;
+
+    // Parse the payload section.
+    // Since the payload section is mostly null-terminated string, so we split the whole thing by null bytes and handle
+    // each part.
+    let mut body_iter = response[5..].split(|&b| b == 0);
+
+    // MOTD, Gametype and Map sections are byte strings. Copy them into a single owned buffer, and manage the indices.
+    let mut result_buf = vec![];
+    // End indices for MOTD and Gametype; Map implicitly ends at the end of buffer, so no additional indice is needed.
+    let mut end_indices = [0; 2];
+    for end_index in end_indices.iter_mut() {
+        // First iteration handles MOTD. Second handles Gametype.
+        let content = body_iter.next().ok_or(ParseError::UnexpectedEndOfInput)?;
+        result_buf.extend_from_slice(content);
+        *end_index = result_buf.len();
+    }
+    // Handle Map.
+    result_buf.extend_from_slice(body_iter.next().ok_or(ParseError::UnexpectedEndOfInput)?);
+
+    // Current/Maximum number of player section.
+    let mut players = [0; 2];
+    for player in &mut players {
+        let player_bytes = body_iter.next().ok_or(ParseError::UnexpectedEndOfInput)?;
+        *player = parse_bytes::<u32>(player_bytes).map_err(|_| malformed())?;
+    }
+
+    let port_ip = body_iter.next().ok_or(ParseError::UnexpectedEndOfInput)?;
+    // Check for the existence of null terminator and end-of-input, before parsing port and ip.
+    let should_be_some_empty = body_iter.next();
+    let should_be_none = body_iter.next();
+    if should_be_none.is_some() {
+        return Err(malformed());
+    }
+    if let Some(bytes) = should_be_some_empty {
+        if !bytes.is_empty() {
+            return Err(malformed());
+        }
+    } else if port_ip.len() <= std::mem::size_of::<u16>() + MAX_IPADDR_LEN {
+        // We've established that there's nothing behind port_ip in the input; it's the postfix.
+        // So we need to check whether port_ip is a prefix of port-IpAddr pair. since all bytes are valid for port,
+        // we don't have to care about it. But unfortunately, there's no easy way to check if host_ip is a prefix of
+        // valid string representation of IpAddr. But the representation does have an upper bound: 45 bytes
+        // (IPv4-Mapped IPv6 Address).
+        // So we consider any byte string shorter than that a potentially-valid IpAddr, and anything longer to be
+        // invalid.
+        return Err(ParseError::UnexpectedEndOfInput);
+    } else {
+        return Err(malformed());
+    }
+
+    // Now that we've ensured that there is something(the null-terminator) behind port_ip, we can forget about
+    // UnexpectedEndOfInput while parsing port_ip.
+
+    let host_port = u16::from_le_bytes(port_ip[..2].try_into().unwrap());
+    let host_ip_bytes = &port_ip[2..];
+    let host_ip = parse_bytes::<IpAddr>(host_ip_bytes).map_err(|_| malformed())?;
+
+    let stat = BasicStat {
+        buf: result_buf.into_boxed_slice(),
+        motd_end: end_indices[0],
+        gametype_end: end_indices[1],
+        num_players: players[0],
+        max_players: players[1],
+        host_port,
+        host_ip,
+    };
+
+    Ok((stat, id))
+}
+
+pub fn parse_full_stat_response(response: &[u8]) -> Result<(FullStat, SessionId), ParseError> {
+    // handshake response datagram looks like this:
+    // * Type (1 byte); should be 0x00
+    // * Session ID (4 bytes)
+    // * Padding (11 bytes)
+    // * KV Section (Pairs of Null-terminated strings)
+    // * Padding (10 bytes)
+    // * Player list (Null-terminated strings)
+    //
+    // Here we make assumptions from parse_basic_stat, and:
+    // * The keys appear in following order in KV Section: hostname, gametype, game_id, version, plugins, map,
+    //   numplayers, maxplayers, hostport, hostip.
+    // * hostport can be parsed into `u16`.
+
+    let malformed = || ParseError::MalformedInput {
+        requested_kind: "full stat response",
+    };
+
+    // Check Type
+    if response.is_empty() {
+        return Err(ParseError::UnexpectedEndOfInput);
+    }
+    if response[0] != TYPE_STAT {
+        return Err(malformed());
+    }
+
+    // Parse Session ID
+    if response.len() < 5 {
+        return Err(if is_valid_partial_session_id(&response[1..]) {
+            ParseError::UnexpectedEndOfInput
+        } else {
+            malformed()
+        });
+    }
+    let id_bytes = <[u8; 4]>::try_from(&response[1..5]).unwrap();
+    let id = SessionId::try_from(id_bytes).map_err(|_| malformed())?;
+
+    // Check for existence of Padding
+    if response.len() <= 16 {
+        return Err(ParseError::UnexpectedEndOfInput);
+    }
+
+    let mut buf = Vec::new();
+
+    // KV Section
+    let mut kv_len = 0;
+    let mut kv_iter = response[16..]
+        .split(|&b| b == 0)
+        // keep track of the length of KV section; 1 is for the null terminator.
+        // Used to get index from which to start parsing again when we're done with KV section.
+        .inspect(|&s| kv_len += s.len() + 1);
+
+    macro_rules! parse_kv {
+        ($expected_key:expr) => {{
+            let key = kv_iter.next();
+            if key != Some($expected_key) {
+                if key.is_some() {
+                    return Err(malformed());
+                } else {
+                    return Err(ParseError::UnexpectedEndOfInput);
+                }
+            }
+            let value = kv_iter.next();
+            if let Some(value) = value {
+                value
+            } else {
+                return Err(ParseError::UnexpectedEndOfInput);
+            }
+        }};
+    }
+
+    // Byte string values.
+    let mut ends = [0; 6]; // End indices for byte string values copied into the buffer.
+    for (&key, end_index) in [
+        &b"hostname"[..],
+        &b"gametype"[..],
+        &b"game_id"[..],
+        &b"version"[..],
+        &b"plugins"[..],
+        &b"map"[..],
+    ]
+    .iter()
+    .zip(ends.iter_mut())
+    {
+        let value = parse_kv!(key);
+        buf.extend_from_slice(value);
+        *end_index = buf.len();
+    }
+
+    // Parsable values.
+    let num_players = parse_bytes::<u32>(parse_kv!(b"numplayers")).map_err(|_| malformed())?;
+    let max_players = parse_bytes::<u32>(parse_kv!(b"maxplayers")).map_err(|_| malformed())?;
+    let host_port = parse_bytes::<u16>(parse_kv!(b"hostport")).map_err(|_| malformed())?;
+
+    let host_ip_value = parse_kv!(b"hostip");
+    let host_ip = parse_bytes::<IpAddr>(host_ip_value).map_err(|e| {
+        if let ParseByteError::Utf8(_) = e {
+            malformed()
+        } else if host_ip_value.len() < MAX_IPADDR_LEN {
+            ParseError::UnexpectedEndOfInput
+        } else {
+            malformed()
+        }
+    })?;
+
+    // Check for the empty key.
+    if let Some(should_be_empty_key) = kv_iter.next() {
+        if !should_be_empty_key.is_empty() {
+            return Err(malformed());
+        }
+    } else {
+        return Err(ParseError::UnexpectedEndOfInput);
+    }
+
+    let kv_end = 16 + kv_len;
+
+    // Check padding.
+    if response.len() < kv_end + 10 {
+        return Err(ParseError::UnexpectedEndOfInput);
+    }
+
+    let player_section_start = kv_end + 10;
+
+    // Player Section.
+    let mut player_ends = Vec::new();
+    let mut empty_player_found = false;
+    let mut players_iter = response[player_section_start..].split(|&b| b == 0);
+    for player in players_iter.by_ref() {
+        if player.is_empty() {
+            // Empty player == end of player section
+            empty_player_found = true;
+            break;
+        }
+        buf.copy_from_slice(player);
+        player_ends.push(buf.len());
+    }
+    if !empty_player_found {
+        return Err(ParseError::UnexpectedEndOfInput);
+    }
+    // Since we've parsed the empty player, there should be no more data.
+    if players_iter.next().is_some() {
+        return Err(malformed());
+    }
+
+    let stat = FullStat {
+        buf: buf.into_boxed_slice(),
+        hostname_end: ends[0],
+        gametype_end: ends[1],
+        gameid_end: ends[2],
+        version_end: ends[3],
+        plugins_end: ends[4],
+        map_end: ends[5],
+        num_players,
+        max_players,
+        host_port,
+        host_ip,
+        player_ends: player_ends.into_boxed_slice(),
+    };
+    Ok((stat, id))
+}
+
+type Parser<OUT> = fn(&[u8]) -> Result<(OUT, SessionId), ParseError>;
 
 #[derive(Debug)]
 pub struct Querier {
@@ -169,14 +449,14 @@ impl Querier {
                 Ok(len) => len,
                 Err(e) => {
                     match self.max_retries() {
-                        Some(max_retries) if max_retries <= retries => {},                        
+                        Some(max_retries) if max_retries <= retries => {}
                         _ => {
                             use io::ErrorKind::*;
                             if [WouldBlock, TimedOut].contains(&e.kind()) {
                                 retries += 1;
                                 continue;
                             }
-                        },
+                        }
                     }
                     return Err(e.into());
                 }
@@ -191,15 +471,12 @@ impl Querier {
     fn stat<REQ, OUT>(
         &mut self,
         req: fn(SessionId, i32) -> REQ,
-        parser: fn(&[u8]) -> Result<OUT, ParseError>
+        parser: Parser<OUT>,
     ) -> Result<OUT, Error>
     where
         REQ: AsRef<[u8]>,
-        OUT: ParseDatagram,
     {
         let mut token = self.last_token.ok_or(()).or_else(|_| self.handshake())?;
-
-        let mut retries = 0;
 
         loop {
             let request = req(SessionId::new(), token);
@@ -207,17 +484,10 @@ impl Querier {
             let mut len = match self.sock.peek(&mut self.buf[..]) {
                 Ok(len) => len,
                 Err(e) => {
-                    match self.max_retries {
-                        Some(max_retries) if max_retries <= retries => {},
-                        _ => {
-                            use io::ErrorKind::*;
-                            if [WouldBlock, TimedOut].contains(&e.kind()) {
-                                self.last_token = None;
-                                token = self.handshake()?;
-                                retries += 1;
-                                continue;
-                            }
-                        }
+                    use io::ErrorKind::*;
+                    if [WouldBlock, TimedOut].contains(&e.kind()) {
+                        token = self.handshake()?;
+                        continue;
                     }
                     return Err(e.into());
                 }
@@ -226,55 +496,48 @@ impl Querier {
             self.last_token = Some(token);
 
             loop {
-                let ret = <OUT>::parse_datagram(
-                    Some(self.session_id),
-                    &self.buf[..len],
-                );
+                let ret = parser(&self.buf[..len]);
 
                 match ret {
-                    Ok(ret) => {
+                    Ok((ret, _)) => {
                         self.sock.recv(&mut self.buf[..])?;
                         return Ok(ret);
-                    },
-                    Err(ParseError::UnexpectedEndOfData) if len == self.buf.len() => {
+                    }
+                    Err(ParseError::UnexpectedEndOfInput) if len == self.buf.len() => {
                         self.buf.resize(self.buf.len() * 2, 0);
                         len = self.sock.peek(&mut self.buf[..])?;
                         continue;
-                    },
+                    }
                     Err(err) => {
                         self.sock.recv(&mut self.buf[..])?;
                         return Err(err.into());
-                    },
+                    }
                 }
             }
         }
     }
 
     pub fn basic_stat(&mut self) -> Result<BasicStat, Error> {
-        self.stat::<[u8; 11], BasicStat>()
+        self.stat(basic_stat_request, parse_basic_stat_response)
     }
 
     pub fn full_stat(&mut self) -> Result<FullStat, Error> {
-        self.stat::<[u8; 15], FullStat>()
+        self.stat(full_stat_request, parse_full_stat_response)
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct BasicStat {
-    buf: Vec<u8>,
+    buf: Box<[u8]>,
     motd_end: usize,
     gametype_end: usize,
-    num_players: u64,
-    max_players: u64,
+    num_players: u32,
+    max_players: u32,
     host_ip: IpAddr,
     host_port: u16,
 }
 
 impl BasicStat {
-    pub fn parse_bytes(bytes: &[u8]) -> Result<Self, ParseError> {
-        Self::parse_datagram(None, bytes)
-    }
-
     pub fn motd(&self) -> &[u8] {
         &self.buf[..self.motd_end]
     }
@@ -287,11 +550,11 @@ impl BasicStat {
         &self.buf[self.gametype_end..]
     }
 
-    pub fn num_players(&self) -> u64 {
+    pub fn num_players(&self) -> u32 {
         self.num_players
     }
 
-    pub fn max_players(&self) -> u64 {
+    pub fn max_players(&self) -> u32 {
         self.max_players
     }
 
@@ -304,94 +567,20 @@ impl BasicStat {
     }
 }
 
-impl ParseDatagram for BasicStat {
-    fn parse_datagram(session_id: Option<u32>, datagram: &[u8]) -> Result<Self, ParseError> {
-        if datagram.len() < 13 {
-            return Err(ParseError::TooShort);
-        }
-        let (header, body) = datagram.split_at(5);
-        if header[0] != 0 {
-            return Err(ParseError::InvalidType {
-                expected: 0,
-                got: header[0],
-            });
-        }
-        if let Some(id) = session_id {
-            let got_id = u32::from_be_bytes(datagram[1..5].try_into().unwrap());
-            if id != got_id {
-                return Err(ParseError::SessionIdMismatch {
-                    expected: id,
-                    got: got_id,
-                });
-            }
-        }
-
-        let mut result_buf = vec![];
-        let mut body_iter = body.split(|&b| b == 0);
-
-        let mut end_indices = [0; 2];
-        let mut last_end_index = 0;
-        for end_index in end_indices.iter_mut() {
-            let content = body_iter.next().ok_or(ParseError::UnexpectedEndOfData)?;
-            result_buf.extend_from_slice(content);
-            *end_index = last_end_index + content.len();
-            last_end_index += content.len();
-        }
-        result_buf.extend_from_slice(body_iter.next().ok_or(ParseError::UnexpectedEndOfData)?);
-
-        let mut players = [0; 2];
-        for player in &mut players {
-            let player_bytes = body_iter.next().ok_or(ParseError::UnexpectedEndOfData)?;
-            *player = parse_bytes_as!(player_bytes, u64, body_iter, "u64")?;
-        }
-
-        let port_ip = body_iter.next().ok_or(ParseError::UnexpectedEndOfData)?;
-        if port_ip.len() < 3 {
-            return Err(ParseError::PartParseFailed {
-                bytes: port_ip.to_owned(),
-                ty: "Little-endian u16 and IpAddr Pair",
-                source: None,
-            });
-        }
-        let host_port = u16::from_le_bytes(port_ip[..2].try_into().unwrap());
-        let host_ip_bytes = &port_ip[2..];
-        // Maximum length of valid string representation of IpAddr seems to be 45 bytes.
-        // Reject anything longer than that.
-        if host_ip_bytes.len() > 45 {
-            return Err(ParseError::PartParseFailed { 
-                bytes: host_ip_bytes.to_owned(),
-                ty: "IpAddr",
-                source: None,
-            });
-        }
-        let host_ip = parse_bytes_as!(host_ip_bytes, IpAddr, body_iter, "IpAddr")?;
-
-        Ok(BasicStat {
-            buf: result_buf,
-            motd_end: end_indices[0],
-            gametype_end: end_indices[1],
-            num_players: players[0],
-            max_players: players[1],
-            host_port,
-            host_ip,
-        })
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct FullStat {
-    buf: Vec<u8>,
+    buf: Box<[u8]>,
     hostname_end: usize,
     gametype_end: usize,
     gameid_end: usize,
     version_end: usize,
     plugins_end: usize,
     map_end: usize,
-    num_players: u64,
-    max_players: u64,
+    num_players: u32,
+    max_players: u32,
     host_port: u16,
     host_ip: IpAddr,
-    player_ends: Vec<usize>,
+    player_ends: Box<[usize]>,
 }
 
 impl FullStat {
@@ -423,7 +612,7 @@ impl FullStat {
         &self.buf[self.plugins_end..self.map_end]
     }
 
-    pub fn reported_num_players(&self) -> u64 {
+    pub fn reported_num_players(&self) -> u32 {
         self.num_players
     }
 
@@ -431,7 +620,7 @@ impl FullStat {
         self.player_ends.len()
     }
 
-    pub fn max_players(&self) -> u64 {
+    pub fn max_players(&self) -> u32 {
         self.max_players
     }
 
@@ -451,136 +640,6 @@ impl FullStat {
                 self.player_ends[idx - 1]
             };
             &self.buf[start..end]
-        })
-    }
-}
-
-impl ParseDatagram for FullStat {
-    fn parse_datagram(session_id: Option<u32>, datagram: &[u8]) -> Result<Self, ParseError> {
-        if datagram.len() < 16 {
-            return Err(ParseError::TooShort);
-        }
-        if datagram[0] != 0 {
-            return Err(ParseError::InvalidType {
-                expected: 0,
-                got: datagram[0],
-            });
-        }
-        if let Some(id) = session_id {
-            let got_id = u32::from_be_bytes(datagram[1..5].try_into().unwrap());
-            if id != got_id {
-                return Err(ParseError::SessionIdMismatch {
-                    expected: id,
-                    got: got_id,
-                });
-            }
-        }
-
-        let mut buf = Vec::new();
-
-        let mut idx = 16;
-        let mut kv_iter = datagram[idx..]
-            .split(|&b| b == 0)
-            .inspect(|&s| idx += s.len() + 1);
-        let mut ends = [0; 6];
-
-        macro_rules! parse_kv {
-            ($expected_key:expr, $do_with_value:expr) => {{
-                let key = kv_iter.next();
-                if key != Some($expected_key) {
-                    if let Some(key) = key {
-                        return Err(ParseError::UnexpectedKey {
-                            expected: $expected_key,
-                            got: key.to_owned(),
-                        });
-                    } else {
-                        return Err(ParseError::UnexpectedEndOfData);
-                    }
-                }
-                let value = kv_iter.next();
-                if let Some(value) = value {
-                    $do_with_value(value)
-                } else {
-                    return Err(ParseError::UnexpectedEndOfData);
-                }
-            }};
-            ($expected_key:expr, APPEND_TO_BUF, $idx:expr) => {
-                parse_kv!($expected_key, |value| {
-                    buf.copy_from_slice(value);
-                    ends[$idx] = buf.len();
-                })
-            };
-            ($expected_key:expr, PARSE_AS, $ty:ty, $description:expr) => {
-                parse_kv!($expected_key, |value| {
-                    parse_bytes_as!(value, $ty, kv_iter, $description)
-                })
-            };
-            ($expected_key:expr, PARSE_AS, $ty:ty, $description:expr, MAX_LEN, $maxlen:expr) => {
-                parse_kv!($expected_key, |value: &[u8]| {
-                    if value.len() > $maxlen {
-                        return Err(ParseError::PartParseFailed {
-                            bytes: value.to_owned(),
-                            ty: $description,
-                            source: None,
-                        });
-                    }
-                    parse_bytes_as!(value, $ty, kv_iter, $description)
-                })
-            };
-        }
-
-        parse_kv!(b"hostname", APPEND_TO_BUF, 0);
-        parse_kv!(b"gametype", APPEND_TO_BUF, 1);
-        parse_kv!(b"game_id", APPEND_TO_BUF, 2);
-        parse_kv!(b"version", APPEND_TO_BUF, 3);
-        parse_kv!(b"plugins", APPEND_TO_BUF, 4);
-        parse_kv!(b"map", APPEND_TO_BUF, 5);
-
-        let num_players = parse_kv!(b"numplayers", PARSE_AS, u64, "u64")?;
-        let max_players = parse_kv!(b"maxplayers", PARSE_AS, u64, "u64")?;
-        let host_port = parse_kv!(b"hostport", PARSE_AS, u16, "u16")?;
-        let host_ip = parse_kv!(b"hostip", PARSE_AS, IpAddr, "IpAddr", MAX_LEN, 45)?;
-
-        match kv_iter.next() {
-            Some(b"") => {}
-            Some(got) => {
-                return Err(ParseError::UnexpectedKey {
-                    expected: b"",
-                    got: got.to_owned(),
-                })
-            }
-            None => return Err(ParseError::UnexpectedEndOfData),
-        }
-
-        let mut player_ends = Vec::with_capacity(num_players as usize);
-        idx += 10;
-        let mut empty_player_found = false;
-        let players_iter = datagram[idx..].split(|&b| b == 0);
-        for player in players_iter {
-            if player == b"" {
-                empty_player_found = true;
-                break;
-            }
-            buf.copy_from_slice(player);
-            player_ends.push(buf.len());
-        }
-        if !empty_player_found {
-            return Err(ParseError::UnexpectedEndOfData);
-        }
-
-        Ok(FullStat {
-            buf,
-            hostname_end: ends[0],
-            gametype_end: ends[1],
-            gameid_end: ends[2],
-            version_end: ends[3],
-            plugins_end: ends[4],
-            map_end: ends[5],
-            num_players,
-            max_players,
-            host_port,
-            host_ip,
-            player_ends,
         })
     }
 }

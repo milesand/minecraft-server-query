@@ -1,5 +1,3 @@
-use bstr::BStr;
-
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error(transparent)]
@@ -10,28 +8,13 @@ pub enum Error {
 
 #[derive(thiserror::Error, Debug)]
 pub enum ParseError {
-    #[error("Datagram was too short to be valid")]
-    TooShort,
-    #[error("Datagram was too long to be valid")]
-    TooLong,
-    #[error("Expected type byte {}, got {} instead", .expected, .got)]
-    InvalidType { expected: u8, got: u8 },
-    #[error("Session ID {:?} was not UTF-8", <&BStr>::from(&.got[..]))]
-    InvalidSessionId { got: [u8; 4] },
-    #[error("Datagram ended unexpectedly")]
-    UnexpectedEndOfData,
-    #[error("Failed to parse {:?} as {}", <&BStr>::from(.bytes.as_slice()), .ty)]
-    PartParseFailed {
-        bytes: Vec<u8>,
-        ty: &'static str,
-        #[source]
-        source: Option<Box<dyn std::error::Error>>,
-    },
-    #[error("Expected key {:?}, got {:?} instead", <&BStr>::from(*.expected), <&BStr>::from(.got.as_slice()))]
-    UnexpectedKey {
-        expected: &'static [u8],
-        got: Vec<u8>,
-    },
-    #[error("Unspecified error")]
-    Unspecified,
+    /// The input was invalid, and could be parsed as requested kind of data.
+    #[error("Failed to parse input as {}", .requested_kind)]
+    MalformedInput { requested_kind: &'static str },
+
+    /// The input is potentially valid, but the end of input was reached.
+    ///
+    /// If this error occured with full buffer, you should try reading the datagram with a larger buffer and try again.
+    #[error("End of input reached unexpectedly")]
+    UnexpectedEndOfInput,
 }
