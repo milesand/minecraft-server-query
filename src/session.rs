@@ -11,7 +11,7 @@ use std::str::Utf8Error;
 /// encoded in UTF-8) in the response. This complicates the parsing of responses as it results in session ID sections
 /// longer than 4 bytes. This type restricts Session IDs to UTF-8 when serializing request, side stepping the issue
 /// altogether.
-/// 
+///
 /// Note that this provides only partial protection when **parsing** a response to non-UTF-8 session ID request, as
 /// are some cases where first 4 bytes of mutated ID is valid UTF-8 and the overflown part can't be distinguished from
 /// the first payload.

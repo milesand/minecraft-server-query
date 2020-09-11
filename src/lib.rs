@@ -3,6 +3,7 @@
 use std::convert::{TryFrom, TryInto};
 use std::io;
 use std::net::{IpAddr, ToSocketAddrs, UdpSocket};
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 pub mod error;
@@ -403,15 +404,22 @@ pub fn parse_full_stat_response(response: &[u8]) -> Result<(FullStat, SessionId)
 
 type Parser<OUT> = fn(&[u8]) -> Result<(OUT, SessionId), ParseError>;
 
+/// A Query client that can connect to and query a single Minecraft server.
+/// 
+/// `Querier` handles tokens, timeouts and retrying. It will cache challenge tokens and reuse them for future requests,
+/// and handle timeouts by retrying upto number of times set by the user.
+/// 
+/// This uses blocking IO.
 #[derive(Debug)]
 pub struct Querier {
     sock: UdpSocket,
     last_token: Option<i32>,
-    max_retries: Option<u32>,
+    max_retries: Option<NonZeroU32>,
     buf: Vec<u8>,
 }
 
 impl Querier {
+    /// Constructs a `Querier` connected to given address.
     pub fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
         let sock = UdpSocket::bind("0.0.0.0:0")?;
         sock.connect(addr)?;
@@ -419,23 +427,42 @@ impl Querier {
         Ok(Querier {
             sock,
             last_token: None,
-            max_retries: None,
-            buf: vec![0; 1500],
+            max_retries: Some(NonZeroU32::new(3).unwrap()),
+            buf: vec![0; 1500],  // Ethernet MTU
         })
     }
 
+    /// Set the number of handshake timeouts allowed before giving up.
+    /// 
+    /// Setting this to `None` will make the Querier retry indefinitely on timeouts. This may cause the thread to block
+    /// indefinitely, if connected to wrong address or the server is down.
+    /// 
+    /// Defaults to `Some(3)`.
+    /// 
+    /// # Panics
+    /// 
+    /// Panics if `max_retires` is `Some(0)`.
     pub fn set_max_retries(&mut self, max_retries: Option<u32>) {
-        self.max_retries = max_retries;
+        assert_ne!(max_retries, Some(0));
+        self.max_retries = max_retries.map(|nz| NonZeroU32::new(nz).unwrap());
     }
 
+    /// The number of handshake timeouts allowed before giving up.
     pub fn max_retries(&self) -> Option<u32> {
-        self.max_retries
+        self.max_retries.map(NonZeroU32::get)
     }
 
+    /// Set read timeout for underlying UDP socket. A Minecraft server sends no response to invalid requests, and
+    /// tokens are invalidated every 30 seconds, so it is expected that a timeout occurs once every 30 seconds. Thus,
+    /// ideally this should be set to minimum duration that still allows communication with the server. An `Err` is
+    /// returned if the zero `Duration` is passed to this method.
+    /// 
+    /// Defaults to 1 second. 
     pub fn set_timeout(&mut self, dur: Duration) -> Result<(), io::Error> {
         self.sock.set_read_timeout(Some(dur))
     }
 
+    /// Read timeout for underlying UDP socket.
     pub fn timeout(&self) -> Result<Duration, io::Error> {
         self.sock.read_timeout().map(Option::unwrap)
     }
@@ -444,7 +471,7 @@ impl Querier {
         let request = handshake_request(SessionId::new());
 
         let mut buf = [0; 17];
-        let mut retries = 0;
+        let mut retries = 1;
         loop {
             self.sock.send(&request)?;
             let len = match self.sock.recv(&mut buf) {
@@ -519,15 +546,18 @@ impl Querier {
         }
     }
 
+    /// Perform a basic stat on the connected server.
     pub fn basic_stat(&mut self) -> Result<BasicStat, Error> {
         self.stat(basic_stat_request, parse_basic_stat_response)
     }
 
+    /// Perform a full stat on the connected server.
     pub fn full_stat(&mut self) -> Result<FullStat, Error> {
         self.stat(full_stat_request, parse_full_stat_response)
     }
 }
 
+/// Result of basic stat.
 #[derive(Clone, Debug)]
 pub struct BasicStat {
     buf: Box<[u8]>,
@@ -540,30 +570,38 @@ pub struct BasicStat {
 }
 
 impl BasicStat {
+    /// MOTD set on the server. This may contain color and formatting codes, resulting in non UTF-8 sequence.
     pub fn motd(&self) -> &[u8] {
         &self.buf[..self.motd_end]
     }
 
+    /// Game type of the server. Typically `b"SMP"`.
     pub fn gametype(&self) -> &[u8] {
         &self.buf[self.motd_end..self.gametype_end]
     }
 
+    /// Name of the map of the server.
     pub fn map(&self) -> &[u8] {
         &self.buf[self.gametype_end..]
     }
 
+    /// Number of current players.
     pub fn num_players(&self) -> u32 {
         self.num_players
     }
 
+    /// Maximum number of players allowed on the server. 
     pub fn max_players(&self) -> u32 {
         self.max_players
     }
 
+    /// Port number the server is bound to.
     pub fn host_port(&self) -> u16 {
         self.host_port
     }
 
+    /// IP address the server is bound to. Note that this is the address server bound itself to, and not the address
+    /// players should connect to to join the server.
     pub fn host_ip(&self) -> IpAddr {
         self.host_ip
     }
@@ -586,55 +624,74 @@ pub struct FullStat {
 }
 
 impl FullStat {
+    /// MOTD set on the server. This may contain color and formatting codes, resulting in non UTF-8 sequence.
     pub fn motd(&self) -> &[u8] {
         self.hostname()
     }
 
+    /// Alias of `motd`.
     pub fn hostname(&self) -> &[u8] {
         &self.buf[..self.hostname_end]
     }
 
+    /// Game type of the server. According to reverse-engineered documentation, hardcoded to `b"SMP"`.
     pub fn gametype(&self) -> &[u8] {
         &self.buf[self.hostname_end..self.gametype_end]
     }
 
+    /// Game ID of the server. According to reverse-engineered documentation, hardcoded to `b"MINECRAFT"`.
     pub fn gameid(&self) -> &[u8] {
         &self.buf[self.gametype_end..self.gameid_end]
     }
 
+    /// The server's Minecraft version.
     pub fn version(&self) -> &[u8] {
         &self.buf[self.gameid_end..self.version_end]
     }
 
+    /// List of plugins running on the server, not used for vanilla servers.
+    /// 
+    /// Bukkit uses the following format: 
+    /// `[SERVER_MOD_NAME[: PLUGIN_NAME(; PLUGIN_NAME...)]]`
     pub fn plugins(&self) -> &[u8] {
         &self.buf[self.version_end..self.plugins_end]
     }
 
+    /// Name of the map of the server.
     pub fn map(&self) -> &[u8] {
         &self.buf[self.plugins_end..self.map_end]
     }
 
+    /// Number of current players, reported by the server. Practically this should equal `num_players`. The server
+    /// reports the number of players and the list of players separately, so it may be possible for the two to vary.
     pub fn reported_num_players(&self) -> u32 {
         self.num_players
     }
 
+    /// Number of players returned in the player list. Practically this should equal `num_players`. The server reports
+    /// the number of players and the list of players separately, so it may be possible for the two to vary.
     pub fn num_players(&self) -> usize {
         self.player_ends.len()
     }
 
+    /// Maximum number of players allowed on the server. 
     pub fn max_players(&self) -> u32 {
         self.max_players
     }
 
+    /// IP address the server is bound to. Note that this is the address server bound itself to, and not the address
+    /// players should connect to to join the server.
     pub fn host_ip(&self) -> IpAddr {
         self.host_ip
     }
 
+    /// Port number the server is bound to.
     pub fn host_port(&self) -> u16 {
         self.host_port
     }
 
-    pub fn player(&self, idx: usize) -> Option<&[u8]> {
+    /// Index the player list and returns the name. Returns `None` if the index was out of range.
+    pub fn get_player(&self, idx: usize) -> Option<&[u8]> {
         self.player_ends.get(idx).map(|&end| {
             let start = if idx == 0 {
                 self.map_end
@@ -644,4 +701,6 @@ impl FullStat {
             &self.buf[start..end]
         })
     }
+    
+    // TODO: add player-iterator
 }
