@@ -1,38 +1,38 @@
 //! **[Query Protocol](https://wiki.vg/Query)**, used for querying the status of a minecraft server.
-//! 
+//!
 //! If you are looking for looking for a high-level component that handles the connection by itself, see [`Querier`].
 //! If you want to handle IO by yourself, request constructors (like [`handshake_request`]) and response parsers
 //! ([`parse_handshake_response`]) may be useful.
-//! 
+//!
 //! # Examples
-//! 
+//!
 //! ## Using [`Querier`]
 //! ```
 //! let mut querier = Querier::connect("127.0.0.1:25565")?;
-//! 
+//!
 //! let stat = querier.full_stat()?;
-//! 
+//!
 //! println!("{:?}", stat.motd());
 //! ```
-//! 
+//!
 //! ## Using request constructors and parsers
 //! ```
 //! use std::net::UdpSocket;
-//! 
+//!
 //! let sock = UdpSocket::bind("0.0.0.0:0");
 //! sock.connect("127.0.0.1:25565");
 //! let mut buf = vec![0u8; 1500];
-//! 
+//!
 //! let handshake = handshake_request(SessionId::new());
 //! sock.send(&handshake)?;
 //! let len = sock.recv(&mut buf[..]);
 //! let (token, _id) = parse_handshake_response(&buf[..len])?;
-//! 
+//!
 //! let full_stat = full_stat_request(SessionId::new(), token);
 //! sock.send(&full_stat)?;
 //! let len = sock.recv(&mut buf[..]);
 //! let (stat, _id) = parse_full_stat_response(&buf[..len])?;
-//! 
+//!
 //! println!("{:?}", stat.motd());
 //! ```
 //! [`Querier`]: ./struct.Querier.html
@@ -444,10 +444,10 @@ pub fn parse_full_stat_response(response: &[u8]) -> Result<(FullStat, SessionId)
 type Parser<OUT> = fn(&[u8]) -> Result<(OUT, SessionId), ParseError>;
 
 /// A Query client that can connect to and query a single Minecraft server.
-/// 
+///
 /// `Querier` handles tokens, timeouts and retrying. It will cache challenge tokens and reuse them for future requests,
 /// and handle timeouts by retrying upto number of times set by the user.
-/// 
+///
 /// This uses blocking IO.
 #[derive(Debug)]
 pub struct Querier {
@@ -467,19 +467,19 @@ impl Querier {
             sock,
             last_token: None,
             max_retries: Some(NonZeroU32::new(3).unwrap()),
-            buf: vec![0; 1500],  // Ethernet MTU
+            buf: vec![0; 1500], // Ethernet MTU
         })
     }
 
     /// Set the number of handshake timeouts allowed before giving up.
-    /// 
+    ///
     /// Setting this to `None` will make the Querier retry indefinitely on timeouts. This may cause the thread to block
     /// indefinitely, if connected to wrong address or the server is down.
-    /// 
+    ///
     /// Defaults to `Some(3)`.
-    /// 
+    ///
     /// # Panics
-    /// 
+    ///
     /// Panics if `max_retires` is `Some(0)`.
     pub fn set_max_retries(&mut self, max_retries: Option<u32>) {
         assert_ne!(max_retries, Some(0));
@@ -495,8 +495,8 @@ impl Querier {
     /// tokens are invalidated every 30 seconds, so it is expected that a timeout occurs once every 30 seconds. Thus,
     /// ideally this should be set to minimum duration that still allows communication with the server. An `Err` is
     /// returned if the zero `Duration` is passed to this method.
-    /// 
-    /// Defaults to 1 second. 
+    ///
+    /// Defaults to 1 second.
     pub fn set_timeout(&mut self, dur: Duration) -> Result<(), io::Error> {
         self.sock.set_read_timeout(Some(dur))
     }
@@ -629,7 +629,7 @@ impl BasicStat {
         self.num_players
     }
 
-    /// Maximum number of players allowed on the server. 
+    /// Maximum number of players allowed on the server.
     pub fn max_players(&self) -> u32 {
         self.max_players
     }
@@ -690,8 +690,8 @@ impl FullStat {
     }
 
     /// List of plugins running on the server, not used for vanilla servers.
-    /// 
-    /// Bukkit uses the following format: 
+    ///
+    /// Bukkit uses the following format:
     /// `[SERVER_MOD_NAME[: PLUGIN_NAME(; PLUGIN_NAME...)]]`
     pub fn plugins(&self) -> &[u8] {
         &self.buf[self.version_end..self.plugins_end]
@@ -714,7 +714,7 @@ impl FullStat {
         self.player_ends.len()
     }
 
-    /// Maximum number of players allowed on the server. 
+    /// Maximum number of players allowed on the server.
     pub fn max_players(&self) -> u32 {
         self.max_players
     }
@@ -741,6 +741,32 @@ impl FullStat {
             &self.buf[start..end]
         })
     }
-    
-    // TODO: add player-iterator
+
+    /// Returns an iterator over the list of players.
+    pub fn players(&self) -> Players {
+        Players {
+            buf: &*self.buf,
+            start: self.map_end,
+            ends: self.player_ends.iter(),
+        }
+    }
+}
+
+/// An iterator over the list of players.
+pub struct Players<'a> {
+    buf: &'a [u8],
+    start: usize,
+    ends: std::slice::Iter<'a, usize>,
+}
+
+impl<'a> Iterator for Players<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        self.ends.next().map(|&end| {
+            let start = self.start;
+            self.start = end;
+            &self.buf[start..end]
+        })
+    }
 }
