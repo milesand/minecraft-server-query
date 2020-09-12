@@ -21,6 +21,7 @@ pub struct SessionId([u8; 4]);
 impl SessionId {
     /// Constructs a `SessionId` with 4 null bytes. Use this if you don't need to match requests with responses.
     pub fn new() -> SessionId {
+        // Four null bytes are trivially valid UTF-8.
         SessionId([0, 0, 0, 0])
     }
 
@@ -30,12 +31,12 @@ impl SessionId {
     /// This puts each 4 bits of `u16` into lower 4 bits of each byte. Higher bits end up first in sequence. For
     /// example, converting `0x1234` will result in sequence `0x01 0x02 0x03 0x04`.
     pub fn from_u16(mut id: u16) -> SessionId {
+        // Four bytes whose higest bit is 0 is valid UTF-8.
         let mut bytes = [0; 4];
         for byte_slot in bytes.iter_mut().rev() {
             *byte_slot = u8::try_from(id & 0b1111).unwrap();
             id >>= 4;
         }
-        debug_assert!(std::str::from_utf8(&bytes).is_ok());
         SessionId(bytes)
     }
 
@@ -111,6 +112,65 @@ impl TryFrom<&'_ str> for SessionId {
             Ok(SessionId(bytes))
         } else {
             Err(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn new_is_valid() {
+        let id = SessionId::new();
+        let id_bytes = id.inner();
+        assert_eq!(id_bytes, [0, 0, 0, 0]);
+        assert!(std::str::from_utf8(&id_bytes).is_ok());
+    }
+
+    #[test]
+    fn from_u16_is_valid() {
+        for n in 0..=u16::max_value() {
+            let id = SessionId::from_u16(n);
+            let id_bytes = id.inner();
+            assert!(std::str::from_utf8(&id_bytes).is_ok());
+            assert_eq!(id.to_u16(), n);
+        }
+    }
+
+    #[test]
+    fn try_from_u8_array_valid() {
+        let valids = [
+            [0x00, 0x00, 0x00, 0x00],
+            [0x7f, 0x7f, 0x7f, 0x7f],
+            [0xc2, 0x80, 0xdf, 0xbf], // 2-2
+            [0xe0, 0xa0, 0x80, 0x42], // 3-1
+            [0x42, 0xef, 0xbf, 0xbf], // 1-3
+            [0xf0, 0x90, 0x80, 0x80], // 4
+            [0xf4, 0x8f, 0xbf, 0xbf],
+            [0xef, 0xbf, 0xbd, 0x42],
+        ];
+
+        for &valid in &valids {
+            assert!(SessionId::try_from_bytes(valid).is_ok());
+        }
+    }
+
+    #[test]
+    fn try_from_u8_array_invalid() {
+        let valids = [
+            [0x80, 0x00, 0x00, 0x00],
+            [0x7f, 0xff, 0x7f, 0x7f],
+            [0xc2, 0xc0, 0xdf, 0xbf],
+            [0xe0, 0x80, 0x80, 0x42],
+            [0x42, 0xef, 0xbf, 0xff],
+            [0xf0, 0x80, 0x80, 0x80],
+            [0xf5, 0x8f, 0xbf, 0xbf],
+            [0xef, 0xbf, 0xbd, 0xef],
+        ];
+
+        for &valid in &valids {
+            assert!(SessionId::try_from_bytes(valid).is_err());
         }
     }
 }

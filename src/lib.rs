@@ -7,33 +7,54 @@
 //! # Examples
 //!
 //! ## Using [`Querier`]
-//! ```
+//! ```no_run
+//! use minecraft_server_query::Querier;
+//! # use minecraft_server_query::error::Error;
+//! 
+//! # fn main() -> Result<(), Error> {
 //! let mut querier = Querier::connect("127.0.0.1:25565")?;
 //!
 //! let stat = querier.full_stat()?;
 //!
-//! println!("{:?}", stat.motd());
+//! for player in stat.players() {
+//!     println!("{}", String::from_utf8_lossy(player));
+//! }
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! ## Using request constructors and parsers
-//! ```
+//! ```no_run
 //! use std::net::UdpSocket;
-//!
-//! let sock = UdpSocket::bind("0.0.0.0:0");
+//! use minecraft_server_query::{
+//!     handshake_request,
+//!     parse_handshake_response,
+//!     full_stat_request,
+//!     parse_full_stat_response,
+//!     SessionId,
+//! };
+//! # use minecraft_server_query::error::Error;
+//! 
+//! # fn main() -> Result<(), Error> {
+//! let sock = UdpSocket::bind("0.0.0.0:0")?;
 //! sock.connect("127.0.0.1:25565");
 //! let mut buf = vec![0u8; 1500];
 //!
 //! let handshake = handshake_request(SessionId::new());
 //! sock.send(&handshake)?;
-//! let len = sock.recv(&mut buf[..]);
+//! let len = sock.recv(&mut buf[..])?;
 //! let (token, _id) = parse_handshake_response(&buf[..len])?;
 //!
 //! let full_stat = full_stat_request(SessionId::new(), token);
 //! sock.send(&full_stat)?;
-//! let len = sock.recv(&mut buf[..]);
+//! let len = sock.recv(&mut buf[..])?;
 //! let (stat, _id) = parse_full_stat_response(&buf[..len])?;
 //!
-//! println!("{:?}", stat.motd());
+//! for player in stat.players() {
+//!     println!("{}", String::from_utf8_lossy(player));
+//! }
+//! # Ok(())
+//! # }
 //! ```
 //! [`Querier`]: ./struct.Querier.html
 //! [`handshake_request`]: ./fn.handshake_request.html
