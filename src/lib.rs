@@ -440,8 +440,11 @@ pub fn parse_full_stat_response(response: &[u8]) -> Result<(FullStat, SessionId)
     if !empty_player_found {
         return Err(ParseError::UnexpectedEndOfInput);
     }
-    // Since we've parsed the empty player, there should be no more data.
-    if players_iter.next().is_some() {
+
+    // Check for null terminator and end-of-input.
+    if players_iter.next().map(|s| !s.is_empty()).unwrap_or(true)
+        || players_iter.next().is_some()
+    {
         return Err(malformed());
     }
 
