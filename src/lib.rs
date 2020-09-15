@@ -10,7 +10,7 @@
 //! ```no_run
 //! use minecraft_server_query::Querier;
 //! # use minecraft_server_query::error::Error;
-//! 
+//!
 //! # fn main() -> Result<(), Error> {
 //! let mut querier = Querier::connect("127.0.0.1:25565")?;
 //!
@@ -34,7 +34,7 @@
 //!     SessionId,
 //! };
 //! # use minecraft_server_query::error::Error;
-//! 
+//!
 //! # fn main() -> Result<(), Error> {
 //! let sock = UdpSocket::bind("0.0.0.0:0")?;
 //! sock.connect("127.0.0.1:25565");
@@ -128,7 +128,15 @@ fn is_valid_partial_session_id(id: &[u8]) -> bool {
     }
     match std::str::from_utf8(id) {
         Ok(_) => true,
-        Err(e) => e.error_len().is_none(),
+        Err(e) => {
+            if e.error_len().is_some() {
+                false
+            } else if e.valid_up_to() == 2 && id.len() == 3 {
+                id[2] < 0b11100000
+            } else {
+                true
+            }
+        }
     }
 }
 
@@ -442,9 +450,7 @@ pub fn parse_full_stat_response(response: &[u8]) -> Result<(FullStat, SessionId)
     }
 
     // Check for null terminator and end-of-input.
-    if players_iter.next().map(|s| !s.is_empty()).unwrap_or(true)
-        || players_iter.next().is_some()
-    {
+    if players_iter.next().map(|s| !s.is_empty()).unwrap_or(true) || players_iter.next().is_some() {
         return Err(malformed());
     }
 
@@ -469,8 +475,8 @@ type Parser<OUT> = fn(&[u8]) -> Result<(OUT, SessionId), ParseError>;
 
 /// A Query client that can connect to and query a single Minecraft server.
 ///
-/// `Querier` handles tokens, timeouts and retrying. It will cache challenge tokens and reuse them for future requests,
-/// and handle timeouts by retrying upto number of times set by the user.
+/// `Querier` handles token caching, buffer resizing, timeouts and retrying. It will cache challenge tokens and reuse
+/// them for future requests, and handle timeouts by retrying upto number of times set by the user.
 ///
 /// This uses blocking IO.
 #[derive(Debug)]
@@ -792,5 +798,148 @@ impl<'a> Iterator for Players<'a> {
             self.start = end;
             &self.buf[start..end]
         })
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_handshake_request() {
+        let test_cases = [
+            (
+                SessionId::try_from_bytes([0, 0, 0, 0]).unwrap(),
+                [0xfe, 0xfd, 0x09, 0, 0, 0, 0],
+            ),
+            (
+                SessionId::try_from_bytes([0, 0, 0, 1]).unwrap(),
+                [0xfe, 0xfd, 0x09, 0, 0, 0, 1],
+            ),
+            (
+                SessionId::try_from_bytes([7, 6, 5, 64]).unwrap(),
+                [0xfe, 0xfd, 0x09, 7, 6, 5, 64u8],
+            ),
+        ];
+
+        for &(payload, expected) in &test_cases {
+            let got = handshake_request(payload);
+            assert_eq!(got, expected);
+        }
+    }
+
+    #[test]
+    fn test_parse_handshake_response_ok() {
+        let test_cases = [
+            (
+                &[
+                    9, 0, 0, 0, 0, 0x39, 0x35, 0x31, 0x33, 0x33, 0x30, 0x37, 0x00,
+                ][..],
+                (9513307, SessionId::try_from_bytes([0, 0, 0, 0]).unwrap()),
+            ),
+            (
+                &[
+                    9, 0, 0, 0, 1, 0x2d, 0x31, 0x32, 0x31, 0x33, 0x35, 0x37, 0x38, 0x36, 0x30,
+                    0x31, 0x00,
+                ][..],
+                (
+                    -1213578601,
+                    SessionId::try_from_bytes([0, 0, 0, 1]).unwrap(),
+                ),
+            ),
+            (
+                &[9, 0, 0, 0, 2, 0x30, 0x00][..],
+                (0, SessionId::try_from_bytes([0, 0, 0, 2]).unwrap()),
+            ),
+            (
+                &[
+                    9, 7, 6, 5, 64, 0x39, 0x36, 0x31, 0x38, 0x37, 0x36, 0x33, 0x34, 0x36, 0x00,
+                ][..],
+                (961876346, SessionId::try_from_bytes([7, 6, 5, 64]).unwrap()),
+            ),
+        ];
+
+        for &(response, expected) in &test_cases {
+            let got = parse_handshake_response(response);
+            assert_eq!(got, Ok(expected));
+        }
+    }
+
+    #[test]
+    fn test_parse_handshake_response_err() {
+        let malformed = ParseError::MalformedInput {
+            requested_kind: "handshake response",
+        };
+
+        let test_cases = [
+            (
+                &[
+                    0, 7, 6, 5, 64, 0x39, 0x36, 0x31, 0x38, 0x37, 0x36, 0x33, 0x34, 0x36, 0x00,
+                ][..], // Invalid type
+                malformed,
+            ),
+            (
+                &[
+                    9, 128, 0, 0, 0, 0x39, 0x35, 0x31, 0x33, 0x33, 0x30, 0x37, 0x00,
+                ][..], // Non-UTF8 Session ID
+                malformed,
+            ),
+            (
+                &[9][..], // Missing Session ID and payload
+                ParseError::UnexpectedEndOfInput,
+            ),
+            (
+                &[9, 7, 6][..], // Incomplete Session ID
+                ParseError::UnexpectedEndOfInput,
+            ),
+            (
+                &[9, 0xc2][..], // Incomplete Session ID
+                ParseError::UnexpectedEndOfInput,
+            ),
+            (
+                &[9, 0x80][..], // Incomplete invalid Session ID
+                malformed,
+            ),
+            (
+                &[9, 0xc2, 0x80, 0xe0], // Incomplete Invalid Session ID; While valid partial UTF-8, ID would overflow 4 bytes
+                malformed,
+            ),
+            (
+                &[9, 0, 0, 0, 3][..], // No payload
+                ParseError::UnexpectedEndOfInput,
+            ),
+            (
+                &[9, 0, 0, 0, 4, 0x00][..], // Null terminator without payload
+                malformed,
+            ),
+            (
+                &[9, 0, 0, 0, 5, 0x40, 0x00][..], // Invalid payload
+                malformed,
+            ),
+            (
+                &[9, 0, 0, 0, 6, 0x2d, 0x00][..], // Invalid payload
+                malformed,
+            ),
+            (
+                &[9, 0, 0, 0, 7, 0x34, 0x32][..], // Incomplete payload
+                ParseError::UnexpectedEndOfInput,
+            ),
+            (
+                &[9, 0, 0, 0, 8, 0x2d][..], // Incomplete payload
+                ParseError::UnexpectedEndOfInput,
+            ),
+        ];
+
+        for &(response, expected) in &test_cases {
+            let got = parse_handshake_response(response);
+            assert_eq!(
+                got,
+                Err(expected),
+                "Testing with {:?} failed; expected {:?}, got {:?}",
+                response,
+                expected,
+                got
+            );
+        }
     }
 }

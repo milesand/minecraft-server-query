@@ -158,7 +158,7 @@ mod test {
 
     #[test]
     fn try_from_u8_array_invalid() {
-        let valids = [
+        let invalids = [
             [0x80, 0x00, 0x00, 0x00],
             [0x7f, 0xff, 0x7f, 0x7f],
             [0xc2, 0xc0, 0xdf, 0xbf],
@@ -169,8 +169,8 @@ mod test {
             [0xef, 0xbf, 0xbd, 0xef],
         ];
 
-        for &valid in &valids {
-            assert!(SessionId::try_from_bytes(valid).is_err());
+        for &invalid in &invalids {
+            assert!(SessionId::try_from_bytes(invalid).is_err());
         }
     }
 }

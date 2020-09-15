@@ -13,7 +13,7 @@ pub enum Error {
 }
 
 /// Parsing errors.
-#[derive(thiserror::Error, Debug)]
+#[derive(Copy, Clone, thiserror::Error, Debug, PartialEq, Eq)]
 pub enum ParseError {
     /// The input was invalid, and could not be parsed as requested kind of data.
     #[error("Failed to parse input as {}", .requested_kind)]
