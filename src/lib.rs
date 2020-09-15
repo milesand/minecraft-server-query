@@ -434,7 +434,7 @@ pub fn parse_full_stat_response(response: &[u8]) -> Result<(FullStat, SessionId)
             empty_player_found = true;
             break;
         }
-        buf.copy_from_slice(player);
+        buf.extend_from_slice(player);
         player_ends.push(buf.len());
     }
     if !empty_player_found {
