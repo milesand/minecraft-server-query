@@ -804,51 +804,43 @@ impl<'a> Iterator for Players<'a> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::str::FromStr;
 
-    #[test]
-    fn test_handshake_request() {
-        let test_cases = [
-            (
-                SessionId::try_from_bytes([0, 0, 0, 0]).unwrap(),
-                [0xfe, 0xfd, 0x09, 0, 0, 0, 0],
-            ),
-            (
-                SessionId::try_from_bytes([0, 0, 0, 1]).unwrap(),
-                [0xfe, 0xfd, 0x09, 0, 0, 0, 1],
-            ),
-            (
-                SessionId::try_from_bytes([7, 6, 5, 64]).unwrap(),
-                [0xfe, 0xfd, 0x09, 7, 6, 5, 64u8],
-            ),
-        ];
-
-        for &(payload, expected) in &test_cases {
-            let got = handshake_request(payload);
-            assert_eq!(got, expected);
+    macro_rules! handshake_request_tests {
+        ($(($input:expr => $expected:expr, $test_name:ident)),+$(,)?) => {
+            $(
+                #[test]
+                fn $test_name() {
+                    let input = SessionId::try_from_bytes($input).unwrap();
+                    let got = handshake_request(input);
+                    assert_eq!(got, $expected);
+                }
+            )+
         }
     }
 
-    macro_rules! make_partial_test {
-        ($input:expr, $test_name:ident) => {
+    handshake_request_tests![
+        ([0, 0, 0, 0] => [0xfe, 0xfd, 0x09, 0, 0, 0, 0], test_handshake_request_1),
+        ([0, 0, 0, 1] => [0xfe, 0xfd, 0x09, 0, 0, 0, 1], test_handshake_request_2),
+        ([7, 6, 5, 64] => [0xfe, 0xfd, 0x09, 7, 6, 5, 64], test_handshake_request_3),
+    ];
+
+    macro_rules! partial_test {
+        ($input:expr, $test_name:ident, $parser_fn:expr) => {
             #[test]
             fn $test_name() {
-                let complete_input = $input;
+                let complete_input = &$input[..];
                 for partial_len in 0..complete_input.len() {
-                    let got = parse_handshake_response(&complete_input[..partial_len]);
-                    assert_eq!(
-                        got,
-                        Err(ParseError::UnexpectedEndOfInput),
-                        "Parsing {:?} returned {:?}",
-                        &complete_input[..partial_len],
-                        got
-                    );
+                    let got = $parser_fn(&complete_input[..partial_len]);
+                    if let Err(ParseError::UnexpectedEndOfInput) = got {
+                        return;
+                    }
+                    panic!("Parsing {:?} returned {:?}", &complete_input[..partial_len], got);
                 }
             }
         };
     }
 
-    macro_rules! make_handshake_tests {
+    macro_rules! parse_handshake_tests {
         ($(($input:expr => ($expected_token:expr, $expected_id:expr), $valid_test:ident, $partial_test:ident)),+$(,)?) => {
             $(
                 #[test]
@@ -858,152 +850,252 @@ mod test {
                     let expected_id = SessionId::try_from_bytes($expected_id).unwrap();
                     match parse_handshake_response(&input[..]) {
                         Ok((got_token, got_id)) => {
-                            assert_eq!(got_token, expected_token);
-                            assert_eq!(got_id, expected_id);
+                            assert_eq!(
+                                got_token,
+                                expected_token,
+                                "Parsing {:?}: Expected token {:?}, got {:?}",
+                                input,
+                                expected_token,
+                                got_token
+                            );
+                            assert_eq!(
+                                got_id,
+                                expected_id,
+                                "Parsing {:?}: Expected ID {:?}, got {:?}",
+                                input,
+                                expected_id,
+                                got_id
+                            );
                         },
-                        Err(e) => panic!("Parsing {:?} returned {:?}", $input, e),
+                        Err(e) => panic!("Parsing {:?} returned Error: {:?}", $input, e),
                     }
                 }
 
-                make_partial_test!($input, $partial_test);
+                partial_test!($input, $partial_test, parse_handshake_response);
             )+
         };
     }
 
-    make_handshake_tests![
+    parse_handshake_tests![
         (
-            b"\x09\x00\x00\x00\x009513307\0" =>
-            (9513307, [0, 0, 0, 0]),
-            handshake_response_ok_1,
-            handshake_response_partial_1
+            b"\x09\x00\x00\x00\x009513307\0" => (9513307, [0, 0, 0, 0]),
+            test_handshake_response_ok_1,
+            test_handshake_response_partial_1
         ),
         (
-            b"\x09\x00\x00\x00\x01-1213578601\0" =>
-            (-1213578601, [0, 0, 0, 1]),
-            handshake_response_ok_2,
-            handshake_response_partial_2
+            b"\x09\x00\x00\x00\x01-1213578601\0" => (-1213578601, [0, 0, 0, 1]),
+            test_handshake_response_ok_2,
+            test_handshake_response_partial_2
         ),
         (
-            b"\x09\x00\x00\x00\x020\0" =>
-            (0, [0, 0, 0, 2]),
-            handshake_response_ok_3,
-            handshake_response_partial_3
+            b"\x09\x00\x00\x00\x020\0" => (0, [0, 0, 0, 2]),
+            test_handshake_response_ok_3,
+            test_handshake_response_partial_3
         ),
         (
-            b"\x09\x07\x06\x05\x40961876346\0" =>
-            (961876346, [7, 6, 5, 64]),
-            handshake_response_ok_4,
-            handshake_response_partial_4
+            b"\x09\x07\x06\x05\x40961876346\0" => (961876346, [7, 6, 5, 64]),
+            test_handshake_response_ok_4,
+            test_handshake_response_partial_4
         ),
     ];
 
-    #[test]
-    fn test_parse_handshake_response_malformed() {
-        let malformed = ParseError::MalformedInput {
-            requested_kind: "handshake response",
+    macro_rules! parse_handshake_malformed_tests {
+        ($(($input:expr, $test_name:ident)),+$(,)?) => {
+            $(
+                #[test]
+                fn $test_name() {
+                    let input = &$input[..];
+                    let got = parse_handshake_response(input);
+                    assert_eq!(
+                        got,
+                        Err(ParseError::MalformedInput {
+                            requested_kind: "handshake response",
+                        }),
+                        "Parsing {:?}: got unexpected result {:?}",
+                        input,
+                        got,
+                    )
+                }
+            )+
+        }
+    }
+
+    parse_handshake_malformed_tests![
+        (b"\x00\x07\x06\x05\x40961876346\0", test_handshake_response_malformed_invalid_type),
+        (b"\x09\x80\x00\x00\x009513307\0", test_handshake_response_malformed_invalid_id),
+        (b"\x09\x80", test_parse_handshake_response_malformed_partial_invalid_id),
+        (b"\x09\xc2\x80\xe0", test_parse_handshake_response_malformed_partial_overflowing_id),
+        (b"\x09\x00\x00\x00\x04\0", test_parse_handshake_response_malformed_terminator_without_payload),
+        (b"\x09\x00\x00\x00\x05@\x00", test_parse_handshake_response_malformed_invalid_payload_1),
+        (b"\x09\x00\x00\x00\x06-\x00", test_parse_handshake_response_malformed_invalid_payload_2),
+    ];
+
+    macro_rules! basic_stat_request_tests {
+        ($((($id:expr, $token:expr) => $expected:expr, $test_name:ident)),+$(,)?) => {
+            $(
+                #[test]
+                fn $test_name() {
+                    let id = SessionId::try_from_bytes($id).unwrap();
+                    let token = $token;
+                    let got = basic_stat_request(id, token);
+                    assert_eq!(got, $expected);
+                }
+            )+
+        }
+    }
+
+    basic_stat_request_tests![
+        (
+            ([0, 0, 1, 0], 9513307) =>
+            [0xfe, 0xfd, 0x00, 0, 0, 1, 0, 0x00, 0x91, 0x29, 0x5bu8],
+            test_basic_stat_request_1
+        ),
+        (
+            ([0, 0, 2, 0], -1213578601) =>
+            [0xfe, 0xfd, 0x00, 0, 0, 2, 0, 0xb7, 0xaa, 0x42, 0x97],
+            test_basic_stat_request_2
+        ),
+        (
+            ([0, 0, 3, 0], 0) =>
+            [0xfe, 0xfd, 0x00, 0, 0, 3, 0, 0x00, 0x00, 0x00, 0x00],
+            test_basic_stat_request_3
+        ),
+        (
+            ([0, 0, 4, 0], 961876346) =>
+            [0xfe, 0xfd, 0x00, 0, 0, 4, 0, 0x39, 0x55, 0x11, 0x7a],
+            test_basic_stat_request_4
+        ),
+    ];
+
+    macro_rules! parse_basic_stat_tests {
+        ($(($input:expr => (
+            $expected_motd:expr,
+            $expected_gametype:expr,
+            $expected_map:expr,
+            $expected_num_players:expr,
+            $expected_max_players:expr,
+            $expected_port:expr,
+            $expected_ip:expr,
+            $expected_id:expr,
+        ), $valid_test:ident, $partial_test:ident)),+$(,)?) => {
+            $(
+                #[test]
+                fn $valid_test() {
+                    let input = &$input[..];
+                    match parse_basic_stat_response(input) {
+                        Ok((got_stat, got_id)) => {
+                            let expected_motd = &$expected_motd[..];
+                            assert_eq!(
+                                got_stat.motd(),
+                                expected_motd,
+                                "Parsing {:?}: Expected motd {:?}, got {:?}",
+                                input,
+                                expected_motd,
+                                got_stat.motd()
+                            );
+                            let expected_gametype = &$expected_gametype[..];
+                            assert_eq!(
+                                got_stat.gametype(),
+                                expected_gametype,
+                                "Parsing {:?}: Expected gametype {:?}, got {:?}",
+                                input,
+                                expected_gametype,
+                                got_stat.gametype()
+                            );
+                            let expected_map = &$expected_map[..];
+                            assert_eq!(
+                                got_stat.map(),
+                                expected_map,
+                                "Parsing {:?}: Expected map {:?}, got {:?}",
+                                input,
+                                expected_map,
+                                got_stat.map()
+                            );
+                            assert_eq!(
+                                got_stat.num_players(),
+                                $expected_num_players,
+                                "Parsing {:?}: Expected num_players {:?}, got {:?}",
+                                input,
+                                $expected_num_players,
+                                got_stat.num_players()
+                            );
+                            assert_eq!(
+                                got_stat.max_players(),
+                                $expected_max_players,
+                                "Parsing {:?}: Expected max_players {:?}, got {:?}",
+                                input,
+                                $expected_max_players,
+                                got_stat.max_players()
+                            );
+                            assert_eq!(
+                                got_stat.host_port(),
+                                $expected_port,
+                                "Parsing {:?}: Expected host_port {:?}, got {:?}",
+                                input,
+                                $expected_port,
+                                got_stat.host_port(),
+                            );
+                            let expected_ip = $expected_ip.parse::<IpAddr>().unwrap();
+                            assert_eq!(
+                                got_stat.host_ip(),
+                                expected_ip,
+                                "Parsing {:?}: Expected host_ip {:?}, got {:?}",
+                                input,
+                                expected_ip,
+                                got_stat.host_ip()
+                            );
+                            let expected_id = SessionId::try_from_bytes($expected_id).unwrap();
+                            assert_eq!(
+                                got_id,
+                                expected_id,
+                                "Parsing {:?}: Expected ID {:?}, got {:?}",
+                                input,
+                                expected_id,
+                                got_id
+                            );
+                        },
+                        Err(e) => panic!("Parsing {:?} returned Error: {:?}", input, e),
+                    }
+                }
+
+                partial_test!($input, $partial_test, parse_basic_stat_response);
+            )+
         };
-
-        let test_cases = [
-            &b"\x00\x07\x06\x05\x40961876346\0"[..], // Invalid type
-            &b"\x09\x80\x00\x00\x009513307\0"[..],   // Non-UTF8 Session ID
-            &b"\x09\x80"[..],                        // Incomplete invalid Session ID
-            &b"\x09\xc2\x80\xe0"[..], // Incomplete Invalid Session ID; While valid partial UTF-8, ID would overflow 4 bytes
-            &b"\x09\x00\x00\x00\x04\0"[..], // Null terminator without payload
-            &b"\x09\x00\x00\x00\x05@\x00"[..], // Invalid payload
-            &b"\x09\x00\x00\x00\x06-\x00"[..], // Invalid payload
-        ];
-
-        for &response in &test_cases {
-            let got = parse_handshake_response(response);
-            assert_eq!(got, Err(malformed),);
-        }
     }
 
-    #[test]
-    fn test_basic_stat_request() {
-        let test_cases = [
-            (
-                (SessionId::try_from_bytes([0, 0, 1, 0]).unwrap(), 9513307),
-                [0xfe, 0xfd, 0x00, 0, 0, 1, 0, 0x00, 0x91, 0x29, 0x5bu8],
+    parse_basic_stat_tests![
+        (
+            b"\0\x00\x00\x01\x00A Minecraft Server\0SMP\0world\02\020\0\xdd\x63127.0.0.1\0" => (
+                b"A Minecraft Server",
+                b"SMP",
+                b"world",
+                2,
+                20,
+                25565,
+                "127.0.0.1",
+                [0, 0, 1, 0],
             ),
-            (
-                (
-                    SessionId::try_from_bytes([0, 0, 2, 0]).unwrap(),
-                    -1213578601,
-                ),
-                [0xfe, 0xfd, 0x00, 0, 0, 2, 0, 0xb7, 0xaa, 0x42, 0x97],
+            test_basic_stat_response_ok_1,
+            test_basic_stat_response_partial_1
+        ),
+        (
+            b"\0\x00\x01\x00\x00\
+              \xA7cA \xA76M\xA7ei\xA7an\xA79e\xA71c\xA75r\xA7ca\xA76f\xA7et \xA7aS\xA79e\xA71r\xA75v\xA7ce\xA76r\xA7r\nNow colored and multiline\0\
+              CMP\0middleearth\015\0200\0\xde\x630.0.0.0\0" => (
+                b"\xA7cA \xA76M\xA7ei\xA7an\xA79e\xA71c\xA75r\xA7ca\xA76f\xA7et \xA7aS\xA79e\xA71r\xA75v\xA7ce\xA76r\xA7r\nNow colored and multiline",
+                b"CMP",
+                b"middleearth",
+                15,
+                200,
+                25566,
+                "0.0.0.0",
+                [0, 1, 0, 0],
             ),
-            (
-                (SessionId::try_from_bytes([0, 0, 3, 0]).unwrap(), 0),
-                [0xfe, 0xfd, 0x00, 0, 0, 3, 0, 0x00, 0x00, 0x00, 0x00],
-            ),
-            (
-                (SessionId::try_from_bytes([0, 0, 4, 0]).unwrap(), 961876346),
-                [0xfe, 0xfd, 0x00, 0, 0, 4, 0, 0x39, 0x55, 0x11, 0x7a],
-            ),
-        ];
+            test_basic_stat_response_ok_2,
+            test_basic_stat_response_partial_2
+        )
+    ];
 
-        for &((id, token), expected) in &test_cases {
-            let got = basic_stat_request(id, token);
-            assert_eq!(got, expected);
-        }
-    }
-
-    #[test]
-    fn test_parse_basic_stat_response_ok() {
-        let test_cases = [
-            (
-                &b"\0\x00\x00\x01\x00A Minecraft Server\0SMP\0world\02\020\0\xdd\x63127.0.0.1\0"[..],
-                (
-                    &b"A Minecraft Server"[..],
-                    &b"SMP"[..],
-                    &b"world"[..],
-                    2u32,
-                    20u32,
-                    25565u16,
-                    IpAddr::from_str("127.0.0.1").unwrap(),
-                    SessionId::try_from_bytes([0, 0, 1, 0]).unwrap()
-                )
-            ),
-            (
-                &b"\0\x00\x01\x00\x00\
-                \xA7cA \xA76M\xA7ei\xA7an\xA79e\xA71c\xA75r\xA7ca\xA76f\xA7et \xA7aS\xA79e\xA71r\xA75v\xA7ce\xA76r\xA7r\nNow colored and multiline\0\
-                CMP\0middleearth\015\0200\0\xde\x630.0.0.0\0"[..],
-                (
-                    &b"\xA7cA \xA76M\xA7ei\xA7an\xA79e\xA71c\xA75r\xA7ca\xA76f\xA7et \xA7aS\xA79e\xA71r\xA75v\xA7ce\xA76r\xA7r\nNow colored and multiline"[..],
-                    &b"CMP"[..],
-                    &b"middleearth"[..],
-                    15u32,
-                    200u32,
-                    25566u16,
-                    IpAddr::from_str("0.0.0.0").unwrap(),
-                    SessionId::try_from_bytes([0, 1, 0, 0]).unwrap()
-                )
-            ),
-        ];
-
-        for &(response, expected) in &test_cases {
-            let (
-                expected_motd,
-                expected_gametype,
-                expected_map,
-                expected_num_players,
-                expected_max_players,
-                expected_port,
-                expected_ip,
-                expected_id,
-            ) = expected;
-            let (got, got_id) = parse_basic_stat_response(response).unwrap();
-            assert_eq!(got.motd(), expected_motd);
-            assert_eq!(got.gametype(), expected_gametype);
-            assert_eq!(got.map(), expected_map);
-            assert_eq!(got.num_players(), expected_num_players);
-            assert_eq!(got.max_players(), expected_max_players);
-            assert_eq!(got.host_port(), expected_port);
-            assert_eq!(got.host_ip(), expected_ip);
-            assert_eq!(got_id, expected_id);
-        }
-    }
 
     #[test]
     fn test_parse_full_stat_response_ok() {
@@ -1017,7 +1109,7 @@ mod test {
                     2u32,
                     20u32,
                     25565u16,
-                    IpAddr::from_str("127.0.0.1").unwrap(),
+                    "127.0.0.1".parse::<IpAddr>().unwrap(),
                     SessionId::try_from_bytes([0, 0, 1, 0]).unwrap()
                 )
             ),
