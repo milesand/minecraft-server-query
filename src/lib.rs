@@ -375,10 +375,10 @@ pub fn parse_full_stat_response(response: &[u8]) -> Result<(FullStat, SessionId)
                 match key {
                     Some(key) if !$expected_key.starts_with(key) => {
                         return Err(malformed());
-                    },
+                    }
                     _ => {
                         return Err(ParseError::UnexpectedEndOfInput);
-                    },
+                    }
                 }
             }
             let value = kv_iter.next();
@@ -471,14 +471,14 @@ pub fn parse_full_stat_response(response: &[u8]) -> Result<(FullStat, SessionId)
     match (players_iter.next(), players_iter.next()) {
         (None, _) => {
             return Err(ParseError::UnexpectedEndOfInput);
-        },
+        }
         (Some(empty), _) if !empty.is_empty() => {
             return Err(malformed());
-        },
+        }
         (Some(_), Some(_)) => {
             return Err(malformed());
-        },
-        _ => {},
+        }
+        _ => {}
     }
 
     let stat = FullStat {
@@ -857,7 +857,12 @@ mod test {
                         if let Err(ParseError::UnexpectedEndOfInput) = got {
                             continue;
                         }
-                        panic!("Parsing {:?} (Length {}) returned {:?}", &complete_input[..partial_len], partial_len, got);
+                        panic!(
+                            "Parsing {:?} (Length {}) returned {:?}",
+                            &complete_input[..partial_len],
+                            partial_len,
+                            got
+                        );
                     }
                 }
             };
@@ -877,12 +882,12 @@ mod test {
                             Err(e) => panic!("Parsing {:?} returned Error: {:?}", $input, e),
                         }
                     }
-    
+
                     partial_test!($input, $partial_test, parse_handshake_response);
                 )+
             };
         }
-    
+
         macro_rules! handshake_malformed_response_tests {
             ($(($input:expr, $test_name:ident)),+$(,)?) => {
                 $(
@@ -903,7 +908,7 @@ mod test {
                 )+
             }
         }
-        
+
         macro_rules! basic_stat_request_tests {
             ($((($id:expr, $token:expr) => $expected:expr, $test_name:ident)),+$(,)?) => {
                 $(
@@ -917,7 +922,7 @@ mod test {
                 )+
             }
         }
-    
+
         macro_rules! basic_stat_response_tests {
             ($(($input:expr => (
                 $expected_motd:expr,
@@ -947,12 +952,12 @@ mod test {
                             Err(e) => panic!("Parsing {:?} returned Error: {:?}", input, e),
                         }
                     }
-    
+
                     partial_test!($input, $partial_test, parse_basic_stat_response);
                 )+
             };
         }
-    
+
         macro_rules! full_stat_response_tests {
             ($(($input:expr => (
                 $expected_motd:expr,
@@ -1031,13 +1036,34 @@ mod test {
     ];
 
     handshake_malformed_response_tests![
-        (b"\x00\x07\x06\x05\x40961876346\0", test_handshake_response_malformed_invalid_type),
-        (b"\x09\x80\x00\x00\x009513307\0", test_handshake_response_malformed_invalid_id),
-        (b"\x09\x80", test_parse_handshake_response_malformed_partial_invalid_id),
-        (b"\x09\xc2\x80\xe0", test_parse_handshake_response_malformed_partial_overflowing_id),
-        (b"\x09\x00\x00\x00\x04\0", test_parse_handshake_response_malformed_terminator_without_payload),
-        (b"\x09\x00\x00\x00\x05@\x00", test_parse_handshake_response_malformed_invalid_payload_1),
-        (b"\x09\x00\x00\x00\x06-\x00", test_parse_handshake_response_malformed_invalid_payload_2),
+        (
+            b"\x00\x07\x06\x05\x40961876346\0",
+            test_handshake_response_malformed_invalid_type
+        ),
+        (
+            b"\x09\x80\x00\x00\x009513307\0",
+            test_handshake_response_malformed_invalid_id
+        ),
+        (
+            b"\x09\x80",
+            test_parse_handshake_response_malformed_partial_invalid_id
+        ),
+        (
+            b"\x09\xc2\x80\xe0",
+            test_parse_handshake_response_malformed_partial_overflowing_id
+        ),
+        (
+            b"\x09\x00\x00\x00\x04\0",
+            test_parse_handshake_response_malformed_terminator_without_payload
+        ),
+        (
+            b"\x09\x00\x00\x00\x05@\x00",
+            test_parse_handshake_response_malformed_invalid_payload_1
+        ),
+        (
+            b"\x09\x00\x00\x00\x06-\x00",
+            test_parse_handshake_response_malformed_invalid_payload_2
+        ),
     ];
 
     basic_stat_request_tests![
