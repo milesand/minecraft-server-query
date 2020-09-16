@@ -261,6 +261,13 @@ pub fn parse_basic_stat_response(response: &[u8]) -> Result<(BasicStat, SessionI
     let mut players = [0; 2];
     for player in &mut players {
         let player_bytes = body_iter.next().ok_or(ParseError::UnexpectedEndOfInput)?;
+        if player_bytes.is_empty() {
+            if body_iter.next().is_some() {
+                return Err(malformed());
+            } else {
+                return Err(ParseError::UnexpectedEndOfInput);
+            }
+        }
         *player = parse_bytes::<u32>(player_bytes).map_err(|_| malformed())?;
     }
 
@@ -365,10 +372,13 @@ pub fn parse_full_stat_response(response: &[u8]) -> Result<(FullStat, SessionId)
         ($expected_key:expr) => {{
             let key = kv_iter.next();
             if key != Some($expected_key) {
-                if key.is_some() {
-                    return Err(malformed());
-                } else {
-                    return Err(ParseError::UnexpectedEndOfInput);
+                match key {
+                    Some(key) if !$expected_key.starts_with(key) => {
+                        return Err(malformed());
+                    },
+                    _ => {
+                        return Err(ParseError::UnexpectedEndOfInput);
+                    },
                 }
             }
             let value = kv_iter.next();
@@ -399,9 +409,17 @@ pub fn parse_full_stat_response(response: &[u8]) -> Result<(FullStat, SessionId)
     }
 
     // Parsable values.
-    let num_players = parse_bytes::<u32>(parse_kv!(b"numplayers")).map_err(|_| malformed())?;
-    let max_players = parse_bytes::<u32>(parse_kv!(b"maxplayers")).map_err(|_| malformed())?;
-    let host_port = parse_bytes::<u16>(parse_kv!(b"hostport")).map_err(|_| malformed())?;
+    fn parse<T: std::str::FromStr>(bytes: &[u8]) -> Result<T, ParseError> {
+        if bytes.is_empty() {
+            return Err(ParseError::UnexpectedEndOfInput);
+        }
+        parse_bytes(bytes).map_err(|_| ParseError::MalformedInput {
+            requested_kind: "full stat response",
+        })
+    }
+    let num_players = parse(parse_kv!(b"numplayers"))?;
+    let max_players = parse(parse_kv!(b"maxplayers"))?;
+    let host_port = parse(parse_kv!(b"hostport"))?;
 
     let host_ip_value = parse_kv!(b"hostip");
     let host_ip = parse_bytes::<IpAddr>(host_ip_value).map_err(|e| {
@@ -431,6 +449,7 @@ pub fn parse_full_stat_response(response: &[u8]) -> Result<(FullStat, SessionId)
     }
 
     let player_section_start = kv_end + 10;
+    println!("{}", player_section_start);
 
     // Player Section.
     let mut player_ends = Vec::new();
@@ -448,10 +467,18 @@ pub fn parse_full_stat_response(response: &[u8]) -> Result<(FullStat, SessionId)
     if !empty_player_found {
         return Err(ParseError::UnexpectedEndOfInput);
     }
-
     // Check for null terminator and end-of-input.
-    if players_iter.next().map(|s| !s.is_empty()).unwrap_or(true) || players_iter.next().is_some() {
-        return Err(malformed());
+    match (players_iter.next(), players_iter.next()) {
+        (None, _) => {
+            return Err(ParseError::UnexpectedEndOfInput);
+        },
+        (Some(empty), _) if !empty.is_empty() => {
+            return Err(malformed());
+        },
+        (Some(_), Some(_)) => {
+            return Err(malformed());
+        },
+        _ => {},
     }
 
     let stat = FullStat {
