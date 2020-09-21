@@ -409,36 +409,35 @@ pub fn parse_full_stat_response(response: &[u8]) -> Result<(FullStat, SessionId)
     }
 
     // Parsable values.
-    fn parse<T: std::str::FromStr>(bytes: &[u8]) -> Result<T, ParseError> {
-        if bytes.is_empty() {
-            return Err(ParseError::UnexpectedEndOfInput);
-        }
-        parse_bytes(bytes).map_err(|_| ParseError::MalformedInput {
-            requested_kind: "full stat response",
-        })
+    macro_rules! parse_kv_to {
+        ($key:expr, $ty:ty) => {
+            parse_kv_to!($key, $ty, |_| false)
+        };
+        ($key:expr, $ty:ty, $is_malformed:expr) => {{
+            let value_bytes = parse_kv!($key);
+            parse_bytes::<$ty>(value_bytes).map_err(|err| {
+                if kv_iter.next().is_some() {
+                   return malformed();
+                }
+                if let ParseByteError::Utf8(_) = err {
+                    return malformed();
+                }
+                if !value_bytes.is_empty() && $is_malformed(value_bytes) {
+                    return malformed();
+                }
+                ParseError::UnexpectedEndOfInput
+            })
+        }};
     }
-    let num_players = parse(parse_kv!(b"numplayers"))?;
-    let max_players = parse(parse_kv!(b"maxplayers"))?;
-    let host_port = parse(parse_kv!(b"hostport"))?;
-
-    let host_ip_value = parse_kv!(b"hostip");
-    let host_ip = parse_bytes::<IpAddr>(host_ip_value).map_err(|e| {
-        if let ParseByteError::Utf8(_) = e {
-            malformed()
-        } else if host_ip_value.len() < MAX_IPADDR_LEN {
-            ParseError::UnexpectedEndOfInput
-        } else {
-            malformed()
-        }
-    })?;
+    let num_players = parse_kv_to!(b"numplayers", u32)?;
+    let max_players = parse_kv_to!(b"maxplayers", u32)?;
+    let host_port = parse_kv_to!(b"hostport", u16)?;
+    let host_ip = parse_kv_to!(b"hostip", IpAddr, |bytes: &[u8]| bytes.len() >= MAX_IPADDR_LEN)?;
 
     // Check for the empty key.
-    if let Some(should_be_empty_key) = kv_iter.next() {
-        if !should_be_empty_key.is_empty() {
-            return Err(malformed());
-        }
-    } else {
-        return Err(ParseError::UnexpectedEndOfInput);
+    let empty_key = kv_iter.next().ok_or(ParseError::UnexpectedEndOfInput)?;
+    if !empty_key.is_empty() {
+        return Err(malformed());
     }
 
     let kv_end = 16 + kv_len;
@@ -470,12 +469,15 @@ pub fn parse_full_stat_response(response: &[u8]) -> Result<(FullStat, SessionId)
     // Check for null terminator and end-of-input.
     match (players_iter.next(), players_iter.next()) {
         (None, _) => {
+            // Missing Null terminator.
             return Err(ParseError::UnexpectedEndOfInput);
         }
         (Some(empty), _) if !empty.is_empty() => {
+            // Something behind the null terminator.
             return Err(malformed());
         }
         (Some(_), Some(_)) => {
+            // Something behind the null terminator.
             return Err(malformed());
         }
         _ => {}
