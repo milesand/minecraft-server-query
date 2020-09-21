@@ -416,13 +416,10 @@ pub fn parse_full_stat_response(response: &[u8]) -> Result<(FullStat, SessionId)
         ($key:expr, $ty:ty, $is_malformed:expr) => {{
             let value_bytes = parse_kv!($key);
             parse_bytes::<$ty>(value_bytes).map_err(|err| {
-                if kv_iter.next().is_some() {
-                   return malformed();
-                }
                 if let ParseByteError::Utf8(_) = err {
                     return malformed();
                 }
-                if !value_bytes.is_empty() && $is_malformed(value_bytes) {
+                if kv_iter.next().is_some() || (!value_bytes.is_empty() && $is_malformed(value_bytes)) {
                     return malformed();
                 }
                 ParseError::UnexpectedEndOfInput
@@ -467,20 +464,9 @@ pub fn parse_full_stat_response(response: &[u8]) -> Result<(FullStat, SessionId)
         return Err(ParseError::UnexpectedEndOfInput);
     }
     // Check for null terminator and end-of-input.
-    match (players_iter.next(), players_iter.next()) {
-        (None, _) => {
-            // Missing Null terminator.
-            return Err(ParseError::UnexpectedEndOfInput);
-        }
-        (Some(empty), _) if !empty.is_empty() => {
-            // Something behind the null terminator.
-            return Err(malformed());
-        }
-        (Some(_), Some(_)) => {
-            // Something behind the null terminator.
-            return Err(malformed());
-        }
-        _ => {}
+    let should_be_empty = players_iter.next().ok_or(ParseError::UnexpectedEndOfInput)?;
+    if !should_be_empty.is_empty() || players_iter.next().is_some() {
+        return Err(malformed());
     }
 
     let stat = FullStat {
