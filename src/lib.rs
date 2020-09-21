@@ -373,7 +373,7 @@ pub fn parse_full_stat_response(response: &[u8]) -> Result<(FullStat, SessionId)
             let key = kv_iter.next();
             if key != Some($expected_key) {
                 match key {
-                    Some(key) if !$expected_key.starts_with(key) => {
+                    Some(key) if !$expected_key.starts_with(key) || kv_iter.next().is_some() => {
                         return Err(malformed());
                     }
                     _ => {
@@ -970,7 +970,7 @@ mod test {
                 $expected_max_players:expr,
                 $expected_port:expr,
                 $expected_ip:expr,
-                $expected_players:expr,
+                [$($expected_player:expr),*],
                 $expected_id:expr
             ), $valid_test:ident, $partial_test:ident)),+$(,)?) => {
                 $(
@@ -989,9 +989,11 @@ mod test {
                                 assert_eq!(got_stat.max_players(), $expected_max_players);
                                 assert_eq!(got_stat.host_port(), $expected_port);
                                 assert_eq!(got_stat.host_ip(), $expected_ip.parse::<IpAddr>().unwrap());
-                                for (expected_player, got_player) in $expected_players.into_iter().zip(got_stat.players()) {
-                                    assert_eq!(got_player, expected_player);
-                                }
+                                let mut got_players = got_stat.players();
+                                $(
+                                    assert_eq!(got_players.next(), Some(&$expected_player[..]));
+                                )*
+                                assert!(got_players.next().is_none());
                                 assert_eq!(got_id, SessionId::try_from_bytes($expected_id).unwrap());
                             },
                             Err(e) => {
@@ -1106,9 +1108,11 @@ mod test {
         ),
         (
             b"\0\x00\x01\x00\x00\
-              \xA7cA \xA76M\xA7ei\xA7an\xA79e\xA71c\xA75r\xA7ca\xA76f\xA7et \xA7aS\xA79e\xA71r\xA75v\xA7ce\xA76r\xA7r\nNow colored and multiline\0\
+              \xA7cA \xA76M\xA7ei\xA7an\xA79e\xA71c\xA75r\xA7ca\xA76f\xA7et \xA7aS\xA79e\xA71r\xA75v\xA7ce\
+              \xA76r\xA7r\nNow colored and multiline\0\
               CMP\0middleearth\015\0200\0\xde\x630.0.0.0\0" => (
-                b"\xA7cA \xA76M\xA7ei\xA7an\xA79e\xA71c\xA75r\xA7ca\xA76f\xA7et \xA7aS\xA79e\xA71r\xA75v\xA7ce\xA76r\xA7r\nNow colored and multiline",
+                b"\xA7cA \xA76M\xA7ei\xA7an\xA79e\xA71c\xA75r\xA7ca\xA76f\xA7et \xA7aS\xA79e\xA71r\xA75v\xA7ce\xA76r\
+                \xA7r\nNow colored and multiline",
                 b"CMP",
                 b"middleearth",
                 15,
@@ -1124,7 +1128,7 @@ mod test {
 
     full_stat_response_tests![
         (
-            b"\0\x00\x00\x01\x00splitnum\x00\x80\x00hostname\0A Minecraft Server\0gametype\0SMP\0game_id\0MINECRAFT\0\
+            b"\x00\x00\x00\x01\x00splitnum\x00\x80\x00hostname\0A Minecraft Server\0gametype\0SMP\0game_id\0MINECRAFT\0\
               version\0Beta 1.9 Prerelease 4\0plugins\0\0map\0world\0numplayers\02\0maxplayers\020\0hostport\025565\0\
               hostip\0127.0.0.1\0\0\x01player_\0\0barneygale\0Vivalahelvig\0\0" =>
             (
@@ -1138,11 +1142,38 @@ mod test {
                 20,
                 25565,
                 "127.0.0.1",
-                vec![&b"barneygale"[..], &b"Vivalahelvig"[..]],
+                [b"barneygale", b"Vivalahelvig"],
                 [0, 0, 1, 0]
             ),
             test_full_stat_response_ok_1,
             test_full_stat_response_partial_1
         ),
+        (
+            b"\x00\x00\x01\x00\x00splitnum\x00\x80\x00\
+              hostname\0\xA7cA \xA76M\xA7ei\xA7an\xA79e\xA71c\xA75r\xA7ca\xA76f\xA7et \xA7aS\xA79e\xA71r\xA75v\
+              \xA7ce\xA76r\xA7r\nNow colored and multiline\0gametype\0CMP\0game_id\0MINECRAFT\0version\01.16.3\0\
+              plugins\0CraftBukkit on Bukkit 1.2.5-R4.0: WorldEdit 5.3; CommandBook 2.1\0map\0middleearth\0\
+              numplayers\010\0maxplayers\0200\0hostport\025566\0hostip\00.0.0.0\0\0\x01player_\0\0xXRingMaster2000Xx\
+              \0GandalfTheGrey\0trolololo\0strider_\02Isengard\0NMYX\0Frodo\04theShire\0hob1937\0PRECIOUS\0\0" => (
+                b"\xA7cA \xA76M\xA7ei\xA7an\xA79e\xA71c\xA75r\xA7ca\xA76f\xA7et \xA7aS\xA79e\xA71r\xA75v\
+                  \xA7ce\xA76r\xA7r\nNow colored and multiline",
+                b"CMP",
+                b"MINECRAFT",
+                b"1.16.3",
+                b"CraftBukkit on Bukkit 1.2.5-R4.0: WorldEdit 5.3; CommandBook 2.1",
+                b"middleearth",
+                10,
+                200,
+                25566,
+                "0.0.0.0",
+                [
+                    b"xXRingMaster2000Xx", b"GandalfTheGrey", b"trolololo", b"strider_", b"2Isengard",
+                    b"NMYX", b"Frodo", b"4theShire", b"hob1937", b"PRECIOUS"
+                ],
+                [0, 1, 0, 0]
+            ),
+            test_full_stat_response_ok_2,
+            test_full_stat_response_partial_2
+        )
     ];
 }
